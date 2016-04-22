@@ -100,7 +100,7 @@
 -export([is_robject/1]).
 -export([update_last_modified/1, update_last_modified/2]).
 -export([strict_descendant/2]).
--export([get_ts_local_key/1]).
+-export([get_ts_local_key/1, get_type_and_key/1]).
 -export([is_ts/1]).
 
 %% @doc Constructor for new riak objects.
@@ -246,6 +246,18 @@ get_ts_local_key(RObj) when is_record(RObj, r_object) ->
     % using update metadata while testing with ts_run2, updates should
     % be applied by this point!
     dict:find(?MD_TS_LOCAL_KEY, get_update_metadata(RObj)).
+
+%% @doc get the type of object and its key
+-spec get_type_and_key(riak_object()) ->
+    {ts, key()} | {kv, key()}.
+get_type_and_key(RObj) ->
+    case riak_object:get_ts_local_key(RObj) of
+        {ok, LocalKey} ->
+            Key = {riak_object:key(RObj), LocalKey},
+            {ts, Key};
+        error ->
+            {kv, riak_object:key(RObj)}
+    end.
 
 %% @private remove all Objects from the list that are causally
 %% dominated by any other object in the list. Only concurrent /

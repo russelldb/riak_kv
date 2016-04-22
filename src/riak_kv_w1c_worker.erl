@@ -53,6 +53,10 @@
 
 -define(DEFAULT_TIMEOUT, 60000).
 
+-type put_return() :: ok | {error, timeout} | {error, term()}.
+-type riak_object() :: riak_object:riak_object().
+-type bucket() :: riak_object:bucket().
+-type proplist() :: proplists:proplist().
 
 %%%===================================================================
 %%% API
@@ -74,37 +78,63 @@ workers() ->
 start_link(Name) ->
     gen_server:start_link({local, Name}, ?MODULE, [], []).
 
-%% @spec put(RObj :: riak_object:riak_object(), proplists:proplist()) ->
-%%        ok |
-%%       {error, timeout} |
-%%       {error, term()}
-put(RObj0, Options) ->
-    Bucket = riak_object:bucket(RObj0),
-    case riak_core_bucket:get_bucket(Bucket) of
-        {error, Reason} ->
-            {error, Reason};
-        BucketProps ->
-            NVal = proplists:get_value(n_val, BucketProps),
-            {RObj, Key, EncodeFn} =
-                kv_or_ts_details(RObj0, riak_object:get_ts_local_key(RObj0)),
-            DocIdx = chash_key(Bucket, Key, BucketProps),
-            Preflist =
-                case proplists:get_value(sloppy_quorum, Options, true) of
-                    true ->
-                        UpNodes = riak_core_node_watcher:nodes(riak_kv),
-                        riak_core_apl:get_apl_ann(DocIdx, NVal, UpNodes);
-                    false ->
-                        riak_core_apl:get_primary_apl(DocIdx, NVal, riak_kv)
-                end,
+-spec put(RObj :: riak_object:riak_object(), proplists:proplist()) ->
+    put_return().
+put(RObj, Options) ->
+    Bucket = riak_object:bucket(RObj),
+    maybe_do_put(riak_core_bucket:get_bucket(Bucket), RObj, Bucket, Options).
 
-            case validate_options(NVal, Preflist, Options, BucketProps) of
-                {ok, W, PW} ->
-                    synchronize_put(
-                      async_put(
-                        RObj, W, PW, Bucket, NVal, Key, EncodeFn, Preflist), Options);
-                Error ->
-                    Error
-            end
+-spec maybe_do_put({error, term()} | proplist(), riak_object(),
+        bucket(), proplist()) -> put_return().
+maybe_do_put({error, Reason}=_BucketProps, _RObj, _Bucket, _Options) ->
+    {error, Reason};
+
+maybe_do_put(BucketProps, RObj, Bucket, Options) ->
+    NVal = proplists:get_value(n_val, BucketProps),
+    {Type, Key} = riak_object:get_type_and_key(RObj),
+    EncodeFn = get_encoding_fn(Type),
+    do_put(Key, RObj, Bucket, BucketProps, Options, NVal, EncodeFn).
+
+get_encoding_fn(ts) ->
+    fun(O) ->
+        MD  = riak_object:get_metadata(O),
+        MD1 = dict:erase(?MD_TS_LOCAL_KEY, MD),
+        O1 = riak_object:update_metadata(O, MD1),
+        riak_object:to_binary(v1, O1, msgpack) end;
+
+get_encoding_fn(kv) ->
+    fun(O) -> riak_object:to_binary(v1, O) end.
+
+-spec do_put(Key::binary(), RObj::riak_object(), Bucket::bucket(),
+        BucketProps::proplist(), Options::proplist(), NVal::pos_integer(),
+        fun((riak_object()) -> binary())) ->
+        put_return().
+do_put(Key, RObj, Bucket, BucketProps, Options, NVal, EncodeFn) ->
+    DocIdx = chash_key(Bucket, Key, BucketProps),
+    Preflist = get_preflist(Options, DocIdx, NVal),
+    validate_and_put(NVal, Options, BucketProps, RObj, Bucket, Key, Preflist, EncodeFn).
+
+
+validate_and_put(NVal, Options, BucketProps, RObj, Bucket, Key, Preflist, EncodeFn) ->
+    case validate_options(NVal, Preflist, Options, BucketProps) of
+        {ok, W, PW} ->
+            actual_put(RObj, W, PW, Bucket, NVal, Key, EncodeFn, Preflist, Options);
+        Error ->
+            Error
+    end.
+
+actual_put(RObj, W, PW, Bucket, NVal, Key, EncodeFn, Preflist, Options) ->
+    synchronize_put(
+        async_put(
+            RObj, W, PW, Bucket, NVal, Key, EncodeFn, Preflist), Options).
+
+get_preflist(Options, DocIdx, NVal) ->
+    case proplists:get_value(sloppy_quorum, Options, true) of
+        true ->
+            UpNodes = riak_core_node_watcher:nodes(riak_kv),
+            riak_core_apl:get_apl_ann(DocIdx, NVal, UpNodes);
+        false ->
+            riak_core_apl:get_primary_apl(DocIdx, NVal, riak_kv)
     end.
 
 -spec async_put(RObj :: riak_object:riak_object(),
@@ -451,22 +481,6 @@ get_request_record(ReqId, #state{entries=Entries} = _State) ->
         {ok, Value} -> Value;
         error -> undefined
     end.
-
-%% Utility function for put/2: is this a TS object with its special
-%% requirements or a more traditional KV object?
-%%
-%% When riak_kv_ts_svc is driving a put request, it can provide
-%% all of these details directly to async_put/8, but when a tombstone
-%% is being put via riak_kv_delete, these must be extracted from the
-%% object.
-kv_or_ts_details(RObj, {ok, LocalKey}) ->
-    MD  = riak_object:get_metadata(RObj),
-    MD1 = dict:erase(?MD_TS_LOCAL_KEY, MD),
-    RObj1 = riak_object:update_metadata(RObj, MD1),
-    {RObj1, {riak_object:key(RObj), LocalKey},
-     fun(O) -> riak_object:to_binary(v1, O, msgpack) end};
-kv_or_ts_details(RObj, error) ->
-    {RObj, riak_object:key(RObj), fun(O) -> riak_object:to_binary(v1, O) end}.
 
 erase_request_record(ReqId, #state{entries=Entries} = State) ->
     case get_request_record(ReqId, State) of
