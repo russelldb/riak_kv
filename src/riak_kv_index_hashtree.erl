@@ -46,7 +46,7 @@
          estimate_keys/1,
          estimate_keys/2,
          hash_index_data/1,
-         hash_object/2,
+         hash_object_or_dots/2,
          update/2,
          start_exchange_remote/4,
          delete/2,
@@ -490,10 +490,11 @@ load_built(#state{trees=Trees}) ->
             false
     end.
 
-%% Generate a hash value for a `riak_object'
--spec hash_object({riak_object:bucket(), riak_object:key()},
+%% @doc Generate a hash value for a `riak_object', either a hash of the object
+%% or a hash of the vclock and the dots from all siblings
+-spec hash_object_or_dots({riak_object:bucket(), riak_object:key()},
                   riak_object_t2b() | riak_object:riak_object()) -> binary().
-hash_object({Bucket, Key}, RObj0) ->
+hash_object_or_dots({Bucket, Key}, RObj0) ->
     try
         RObj = case riak_object:is_robject(RObj0) of
             true -> RObj0;
@@ -505,6 +506,7 @@ hash_object({Bucket, Key}, RObj0) ->
             Null = erlang:phash2(<<>>),
             term_to_binary(Null)
     end.
+
 
 hash_index_data(IndexData) when is_list(IndexData) ->
     Bin = term_to_binary(lists:usort(IndexData)),
@@ -576,7 +578,7 @@ fold_fun(Tree, _HasIndexTree = true) ->
 object_fold_fun(Tree) ->
     fun(BKey={Bucket,Key}, RObj, BinBKey) ->
             IndexN = riak_kv_util:get_index_n({Bucket, Key}),
-            insert([{IndexN, BinBKey, hash_object(BKey, RObj)}],
+            insert([{IndexN, BinBKey, hash_object_or_dots(BKey, RObj)}],
                    [if_missing],
                    Tree)
     end.
@@ -713,7 +715,7 @@ expand_items(HasIndex, Items) ->
 expand_item(Has2ITree, {object, BKey, RObj}, Others) ->
     IndexN = riak_kv_util:get_index_n(BKey),
     BinBKey = term_to_binary(BKey),
-    ObjHash = hash_object(BKey, RObj),
+    ObjHash = hash_object_or_dots(BKey, RObj),
     Item0 = {IndexN, BinBKey, ObjHash},
     case Has2ITree of
         false ->

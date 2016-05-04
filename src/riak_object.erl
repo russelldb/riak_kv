@@ -84,7 +84,7 @@
 -export([increment_vclock/2, increment_vclock/3, prune_vclock/3, vclock_descends/2, all_actors/1]).
 -export([actor_counter/2]).
 -export([key/1, get_metadata/1, get_metadatas/1, get_values/1, get_value/1]).
--export([hash/1, approximate_size/2]).
+-export([hash/1, hash_dots/1, approximate_size/2]).
 -export([vclock_encoding_method/0, vclock/1, vclock_header/1, encode_vclock/1, decode_vclock/1]).
 -export([encode_vclock/2, decode_vclock/2]).
 -export([update/5, update_value/2, update_metadata/2, bucket/1, bucket_only/1, type/1, value_count/1]).
@@ -629,6 +629,13 @@ hash(Obj=#r_object{}) ->
     Vclock = vclock(Obj),
     UpdObj = riak_object:set_vclock(Obj, lists:sort(Vclock)),
     erlang:phash2(to_binary(v0, UpdObj)).
+
+%% @doc generate a hash for an objects vclock and content dots
+-spec hash_dots(riak_object()) -> integer().
+hash_dots(Obj=#r_object{}) ->
+    Vclock = vclock(Obj),
+    erlang:phash(to_binary(v0, Vclock)).
+
 
 %% @doc  Set the updated metadata of an object to M.
 -spec update_metadata(riak_object(), riak_object_dict()) -> riak_object().
