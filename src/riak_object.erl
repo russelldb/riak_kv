@@ -623,12 +623,11 @@ get_value(Object=#r_object{}) ->
     [{_M,Value}] = get_contents(Object),
     Value.
 
-%% @doc calculates the hash of a riak object
+%% @doc calculates the canonical hash of a riak object using sorted vclock
 -spec hash(riak_object()) -> integer().
 hash(Obj=#r_object{}) ->
     Vclock = vclock(Obj),
-    UpdObj = riak_object:set_vclock(Obj, lists:sort(Vclock)),
-    erlang:phash2(to_binary(v0, UpdObj)).
+    erlang:phash2(to_binary(v0, lists:sort(Vclock))).
 
 %% @doc  Set the updated metadata of an object to M.
 -spec update_metadata(riak_object(), riak_object_dict()) -> riak_object().
