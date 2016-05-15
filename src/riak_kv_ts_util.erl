@@ -64,22 +64,33 @@ sql_record_to_tuple(?SQL_SELECT{'FROM'   = From,
                                 'WHERE'  = Where}) ->
     {From, Select, Where}.
 
+%%
+ql_group_by_to_sql_record(Mod, SQL) ->
+    Identifiers = proplists:get_value(group_by, SQL),
+    Fn =
+        fun(undefined, F) -> error(io_lib:format("unknown field ~s", [F]));
+           (N, F)         -> {N, F}
+        end,
+    [Fn(Mod:get_field_position([F]), F) || {identifier, F} <- Identifiers].
+
 %% Convert the proplist obtained from the QL parser
 build_sql_record(select, SQL, Cover, Stream) ->
     T = proplists:get_value(tables, SQL),
-    F = proplists:get_value(fields, SQL),
+    Fields = proplists:get_value(fields, SQL),
     L = proplists:get_value(limit, SQL),
     W = proplists:get_value(where, SQL),
+    Mod = riak_ql_ddl:make_module_name(T),
     case is_binary(T) of
         true ->
             {ok,
-             ?SQL_SELECT{'SELECT'   = #riak_sel_clause_v1{clause = F},
+             ?SQL_SELECT{'SELECT'   = #riak_sel_clause_v1{clause = Fields},
                          'FROM'     = T,
                          'WHERE'    = W,
                          'LIMIT'    = L,
-                         helper_mod = riak_ql_ddl:make_module_name(T),
+                         helper_mod = Mod,
                          cover_context = Cover,
-                         stream = Stream }
+                         stream = Stream,
+                         group_by = ql_group_by_to_sql_record(Mod, SQL) }
             };
         false ->
             {error, <<"Must provide exactly one table name">>}
