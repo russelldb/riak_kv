@@ -31,6 +31,8 @@
     terminate/2,
     code_change/3]).
 
+-compile(export_all).
+
 -include_lib("riak_kv_vnode.hrl").
 -include("riak_kv_wm_raw.hrl").
 
