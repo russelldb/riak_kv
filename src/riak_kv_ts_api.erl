@@ -40,6 +40,8 @@
          %% use riak_kv_ts_util:sql_to_cover/4.
         ]).
 
+-compile(export_all).
+
 -include_lib("riak_ql/include/riak_ql_ddl.hrl").
 -include("riak_kv_wm_raw.hrl").
 -include("riak_kv_ts.hrl").
@@ -116,10 +118,10 @@ put_data_to_partitions(Data, Bucket, BucketProps, DDL, Mod) ->
     PreflistData = add_preflists(PartitionedData, NVal,
                                  riak_core_node_watcher:nodes(riak_kv)),
 
-    SendFullBatches = riak_core_capability:get({riak_kv, w1c_batch_vnode}, false),
+%    SendFullBatches = riak_core_capability:get({riak_kv, w1c_batch_vnode}, false),
     %% Default to 1MB for a max batch size to not overwhelm disterl
-    CappedBatchSize = app_helper:get_env(riak_kv, timeseries_max_batch_size,
-                                         1024 * 1024),
+%    CappedBatchSize = app_helper:get_env(riak_kv, timeseries_max_batch_size,
+%                                         1024 * 1024),
     EncodeFn =
         fun(O) -> riak_object:to_binary(v1, O, msgpack) end,
 
