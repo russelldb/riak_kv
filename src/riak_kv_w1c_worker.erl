@@ -223,13 +223,13 @@ init(_) ->
 handle_call(_Request, _From, State) ->
     {reply, undefined, State}.
 
-handle_cast({put, Bucket, BucketProps, PartitionIdx, Key, EncodedVal, ReqId, Preflist, #rec{from=From}=Rec}, #state{proxies=Proxies}=State) ->
+handle_cast({put, Bucket, _BucketProps, _PartitionIdx, Key, EncodedVal, ReqId, Preflist, #rec{from=From}=Rec}, #state{proxies=Proxies}=State) ->
     NewState = case store_request_record(ReqId, Rec, State) of
                    {undefined, S} ->
                        UpdProxies = send_vnodes(Preflist, Proxies, Bucket, Key, EncodedVal, ReqId),
-                       postcommit(data_type_by_key(Key), Bucket,
-                                  maybe_ts_markup(PartitionIdx, Bucket, Key, EncodedVal),
-                                  BucketProps),
+%                       postcommit(data_type_by_key(Key), Bucket,
+%                                  maybe_ts_markup(PartitionIdx, Bucket, Key, EncodedVal),
+%                                  BucketProps),
                        S#state{proxies=UpdProxies};
                    {_, S} ->
                        reply(From, ReqId, {error, request_id_already_defined}),

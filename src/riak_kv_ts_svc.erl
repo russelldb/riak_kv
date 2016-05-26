@@ -240,11 +240,11 @@ wait_until_active(Table, State, Seconds) ->
 
 %% NB: since this method deals with PB and TTB messages, the message must be fully
 %% decoded before sub_tsputreq is called
-sub_tsputreq(Mod, _DDL, #tsputreq{table = Table, rows = Rows},
+sub_tsputreq(Mod, DDL, #tsputreq{table = Table, rows = Rows},
              State) ->
     case riak_kv_ts_util:validate_rows(Mod, Rows) of
         [] ->
-            case riak_kv_ts_api:put_data(Rows, Table, Mod) of
+            case riak_kv_ts_api:put_data(Rows, Table, Mod, DDL) of
                 ok ->
                     {reply, #tsputresp{}, State};
                 {error, {some_failed, ErrorCount}} ->

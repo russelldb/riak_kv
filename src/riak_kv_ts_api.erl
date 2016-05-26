@@ -89,7 +89,9 @@ put_data(Data, Table) ->
 -spec put_data([[riak_pb_ts_codec:ldbvalue()]], binary(), module()) ->
                       ok | {error, {some_failed, integer()}} | {error, term()}.
 put_data(Data, Table, Mod) ->
-    DDL = Mod:get_ddl(),
+    put_data(Data, Table, Mod, Mod:get_ddl()).
+
+put_data(Data, Table, Mod, DDL) ->
     Bucket = riak_kv_ts_util:table_to_bucket(Table),
     case riak_core_bucket:get_bucket(Bucket) of
         {error, Reason} ->
