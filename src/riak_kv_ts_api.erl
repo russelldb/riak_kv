@@ -129,11 +129,12 @@ put_data_to_partitions(Data, Bucket, BucketProps, DDL, Mod) ->
                   case riak_kv_w1c_worker:validate_options(
                          NVal, Preflist, [], BucketProps) of
                       {ok, W, PW} ->
-                          DataForVnode = pick_batch_option(SendFullBatches,
-                                                           CappedBatchSize,
-                                                           Records,
-                                                           termsize(hd(Records)),
-                                                           length(Records)),
+%                          DataForVnode = pick_batch_option(SendFullBatches,
+%                                                           CappedBatchSize,
+%                                                           Records,
+%                                                           termsize(hd(Records)),
+%                                                           length(Records)),
+			  DataForVnode = {individual, Records},
                           Ids =
                               invoke_async_put(fun(Record) ->
                                                        build_object(Bucket, Mod, DDL,
