@@ -91,9 +91,9 @@ add_result({dw, Idx, ResObj, _ReqId}, PutCore = #putcore{results = Results,
                                                          num_dw = NumDW}) ->
     num_pw(PutCore#putcore{results = [{Idx, {dw, ResObj}} | Results],
                     num_dw = NumDW + 1}, Idx);
-add_result({fail, Idx, _ReqId}, PutCore = #putcore{results = Results,
+add_result({fail, Idx, Reason}, PutCore = #putcore{results = Results,
                                                    num_fail = NumFail}) ->
-    PutCore#putcore{results = [{Idx, {error, undefined}} | Results],
+    PutCore#putcore{results = [{Idx, {error, Reason}} | Results],
                     num_fail = NumFail + 1};
 add_result(_Other, PutCore = #putcore{num_fail = NumFail}) ->
     %% Treat unrecognized messages as failures - no index to store them against
