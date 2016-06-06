@@ -2320,87 +2320,87 @@ negate_an_aggregation_function_test() ->
         finalise_aggregate(Select, [3])
       ).
 
-helper_desc_order_on_quantum_ddl() ->
-    get_ddl(
-        "CREATE TABLE table1 ("
-        "a SINT64 NOT NULL, "
-        "b SINT64 NOT NULL, "
-        "c TIMESTAMP NOT NULL, "
-        "PRIMARY KEY ((a,b,quantum(c, 1, 's')), a,b,c DESC))").
+% helper_desc_order_on_quantum_ddl() ->
+%     get_ddl(
+%         "CREATE TABLE table1 ("
+%         "a SINT64 NOT NULL, "
+%         "b SINT64 NOT NULL, "
+%         "c TIMESTAMP NOT NULL, "
+%         "PRIMARY KEY ((a,b,quantum(c, 1, 's')), a,b,c DESC))").
 
-query_desc_order_on_quantum_at_quanta_boundaries_test() ->
-    {ok, Q} = get_query(
-          "SELECT * FROM table1 "
-          "WHERE a = 1 AND b = 1 AND c >= 4000 AND c <= 5000"),
-    {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
-    SubQueryWheres = [S#riak_select_v1.'WHERE' || S <- SubQueries],
-    ?assertEqual(
-        [
-            [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {filter,[]},
-             {end_inclusive,true},
-             {start_inclusive,true}]
-            ,
-            [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
-             {filter,[]},
-             {start_inclusive,false},
-             {end_inclusive,true}]
-        ],
-        SubQueryWheres
-    ).
+% query_desc_order_on_quantum_at_quanta_boundaries_test() ->
+%     {ok, Q} = get_query(
+%           "SELECT * FROM table1 "
+%           "WHERE a = 1 AND b = 1 AND c >= 4000 AND c <= 5000"),
+%     {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
+%     SubQueryWheres = [S#riak_select_v1.'WHERE' || S <- SubQueries],
+%     ?assertEqual(
+%         [
+%             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {filter,[]},
+%              {end_inclusive,true},
+%              {start_inclusive,true}]
+%             ,
+%             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
+%              {filter,[]},
+%              {start_inclusive,false},
+%              {end_inclusive,true}]
+%         ],
+%         SubQueryWheres
+%     ).
 
-fix_subquery_order_test() ->
-    {ok, Q} = get_query(
-          "SELECT * FROM table1 "
-          "WHERE a = 1 AND b = 1 AND c >= 4000 AND c <= 5000"),
-    {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
-    ?assertEqual(
-        [
-            [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {filter,[]},
-             {end_inclusive,true},
-             {start_inclusive,true}]
-            ,
-            [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
-             {filter,[]},
-             {start_inclusive,false},
-             {end_inclusive,true}]
-        ],
-        [S#riak_select_v1.'WHERE' || S <- fix_subquery_order(SubQueries)]
-    ).
+% fix_subquery_order_test() ->
+%     {ok, Q} = get_query(
+%           "SELECT * FROM table1 "
+%           "WHERE a = 1 AND b = 1 AND c >= 4000 AND c <= 5000"),
+%     {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
+%     ?assertEqual(
+%         [
+%             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {filter,[]},
+%              {end_inclusive,true},
+%              {start_inclusive,true}]
+%             ,
+%             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
+%              {filter,[]},
+%              {start_inclusive,false},
+%              {end_inclusive,true}]
+%         ],
+%         [S#riak_select_v1.'WHERE' || S <- fix_subquery_order(SubQueries)]
+%     ).
 
-query_desc_order_on_quantum_at_quantum_across_quanta_test() ->
-    {ok, Q} = get_query(
-          "SELECT * FROM table1 "
-          "WHERE a = 1 AND b = 1 AND c >= 3500 AND c <= 5500"),
-    {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
-    SubQueryWheres = [S#riak_select_v1.'WHERE' || S <- SubQueries],
-    ?assertEqual(
-        [
-            [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5500}]},
-             {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {filter,[]},
-             {end_inclusive,true},
-             {start_inclusive,true}]
-            ,
-            [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
-             {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
-             {filter,[]},
-             {start_inclusive,false},
-             {end_inclusive,true}]
-            ,
-            [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
-             {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,3500}]},
-             {filter,[]},
-             {start_inclusive,false},
-             {end_inclusive,true}]
-        ],
-        SubQueryWheres
-    ).
+% query_desc_order_on_quantum_at_quantum_across_quanta_test() ->
+%     {ok, Q} = get_query(
+%           "SELECT * FROM table1 "
+%           "WHERE a = 1 AND b = 1 AND c >= 3500 AND c <= 5500"),
+%     {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
+%     SubQueryWheres = [S#riak_select_v1.'WHERE' || S <- SubQueries],
+%     ?assertEqual(
+%         [
+%             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5500}]},
+%              {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {filter,[]},
+%              {end_inclusive,true},
+%              {start_inclusive,true}]
+%             ,
+%             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
+%              {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
+%              {filter,[]},
+%              {start_inclusive,false},
+%              {end_inclusive,true}]
+%             ,
+%             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,4000}]},
+%              {endkey,  [{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,3500}]},
+%              {filter,[]},
+%              {start_inclusive,false},
+%              {end_inclusive,true}]
+%         ],
+%         SubQueryWheres
+%     ).
 
 coverage_context_not_a_tuple_or_invalid_checksum_test() ->
     NotACheckSum = 34,

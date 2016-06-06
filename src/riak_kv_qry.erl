@@ -208,18 +208,20 @@ do_describe(?DDL{fields = FieldSpecs,
     {ok, {ColumnNames, ColumnTypes, Rows}}.
 
 %%
-describe_field_order(Name, LKSpec) when is_binary(Name) ->
-    case lists:keyfind([Name], #param_v1.name, LKSpec) of
-        #param_v1{ ordering = descending } ->
-            <<"DESC">>;
-        #param_v1{ ordering = ParamOrder } when ParamOrder == ascending;
-                                                ParamOrder == undefined ->
-            <<"ASC">>;
-        false ->
-            %% NULL if the field is not in the local
-            %% key because it canot affect the order
-            []
-    end.
+describe_field_order(Name, _LKSpec) when is_binary(Name) ->
+    <<"ASC">>.
+    % case lists:keyfind([Name], #param_v1.name, LKSpec) of
+    %     #param_v1{ ordering = descending } ->
+    %         <<"DESC">>;
+    %     #param_v1{ ordering = ParamOrder } when ParamOrder == ascending;
+    %                                             ParamOrder == undefined ->
+    %     _ ->
+    %         <<"ASC">>;
+    %     false ->
+    %         %% NULL if the field is not in the local
+    %         %% key because it canot affect the order
+    %         []
+    % end.
 
 %% the following two functions are identical, for the way fields and
 %% keys are represented as of 2015-12-18; duplication here is a hint
@@ -314,11 +316,11 @@ describe_table_columns_test() ->
     Res = do_describe(DDL),
     ?assertMatch(
        {ok, {_, _,
-             [[<<"f">>, <<"varchar">>,   false, 1,  1, <<"ASC">>],
-              [<<"s">>, <<"varchar">>,   false, 2,  2, <<"ASC">>],
-              [<<"t">>, <<"timestamp">>, false, 3,  3, <<"ASC">>],
-              [<<"w">>, <<"sint64">>,    false, [], [], []],
-              [<<"p">>, <<"double">>,    true,  [], [], []]]}},
+             [[<<"f">>, <<"varchar">>,   false, 1,  1,  <<"ASC">>],
+              [<<"s">>, <<"varchar">>,   false, 2,  2,  <<"ASC">>],
+              [<<"t">>, <<"timestamp">>, false, 3,  3,  <<"ASC">>],
+              [<<"w">>, <<"sint64">>,    false, [], [], <<"ASC">>],
+              [<<"p">>, <<"double">>,    true,  [], [], <<"ASC">>]]}},
        Res).
 
 validate_make_insert_row_basic_test() ->
