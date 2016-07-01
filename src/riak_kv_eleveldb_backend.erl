@@ -47,6 +47,7 @@
          range_scan/4,
          is_empty/1,
          status/1,
+	 print_version/0,
          callback/3]).
 -export([data_size/1]).
 
@@ -480,6 +481,9 @@ fold_indexes_fun(FoldIndexFun) ->
 
 build_list({_K, _V}=KV, Acc) ->
     [KV | Acc].
+
+print_version() ->
+    {"perf/msgpack_test"}.
 
 range_scan(FoldIndexFun, Buffer, Opts, #state{fold_opts=_FoldOpts,
                                               ref=Ref}) ->
