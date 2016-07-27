@@ -105,11 +105,13 @@ decode_query(#tsinterpolation{base = BaseQuery}, Cover) ->
             {error, Other}
     end.
 
+
 decode_query_permissions(QryType, {DDL = ?DDL{}, _WithProps}) ->
     decode_query_permissions(QryType, DDL);
 decode_query_permissions(QryType, Qry) ->
-    {riak_kv_ts_api:api_call_from_sql_type(QryType),
-     riak_kv_ts_util:queried_table(Qry)}.
+    SqlType = riak_kv_ts_api:api_call_from_sql_type(QryType),
+    Perm = riak_kv_ts_api:api_call_to_perm(SqlType),
+    {Perm, riak_kv_ts_util:queried_table(Qry)}.
 
 
 -spec process(atom() | ts_requests() | ts_query_types(), #state{}) ->
@@ -131,12 +133,14 @@ process(M = #tsdelreq{table = Table}, State) ->
 process(M = #tslistkeysreq{table = Table}, State) ->
     check_table_and_call(Table, fun sub_tslistkeysreq/4, M, State);
 
-%% No support yet for replacing coverage components; we'll ignore any
-%% value provided for replace_cover
 process(M = #tscoveragereq{table = Table}, State) ->
     check_table_and_call(Table, fun sub_tscoveragereq/4, M, State);
 
-%% this is tsqueryreq, subdivided per query type in its SQL
+%% The following heads of `process' are all, in terms of protobuffer
+%% structures, a `#tsqueryreq{}', subdivided per query type (CREATE
+%% TABLE, SELECT, DESCRIBE, INSERT). The first argument will be the
+%% specific SQL converted from the original `#tsqueryreq{}' in
+%% `riak_kv_pb_ts:decode' via `decode_query_common').
 process({DDL = ?DDL{}, WithProperties}, State) ->
     %% the only one that doesn't require an activated table
     create_table({DDL, WithProperties}, State);
@@ -339,7 +343,7 @@ sub_tsdelreq(Mod, _DDL, #tsdelreq{table = Table,
 
 
 %% -----------
-%% listkeys
+%% list_keys
 %% -----------
 
 sub_tslistkeysreq(Mod, DDL, #tslistkeysreq{table = Table,
@@ -356,7 +360,7 @@ sub_tslistkeysreq(Mod, DDL, #tslistkeysreq{table = Table,
     KeyConvFn =
         fun(Key) when is_binary(Key) ->
                 PossiblyNegatedRow = sext:decode(Key),
-                LocalKey = riak_ql_ddl:get_local_key(DDL, PossiblyNegatedRow, Mod),
+                LocalKey = riak_kv_ts_util:lk_to_pk(PossiblyNegatedRow, DDL, Mod),
                 UnnegatedRow = riak_kv_ts_util:encode_typeval_key(LocalKey),
                 riak_kv_ts_util:row_to_key(UnnegatedRow, DDL, Mod);
            (Key) ->
@@ -399,18 +403,23 @@ sub_tslistkeysreq(Mod, DDL, #tslistkeysreq{table = Table,
 %% -----------
 
 sub_tscoveragereq(Mod, _DDL, #tscoveragereq{table = Table,
-                                            query = Q},
-                  State) ->
+                                            query = Q,
+                                            replace_cover=R,
+                                            unavailable_cover=U}, State) ->
     Client = {riak_client, [node(), undefined]},
     %% all we need from decode_query is to compile the query,
     %% but also to check permissions
     case decode_query(Q, undefined) of
         {_QryType, {ok, SQL}} ->
-            case riak_kv_ts_api:compile_to_per_quantum_queries(Mod, SQL) of
+            %% Make sure, if we pass a replacement cover, we use it to
+            %% determine the proper where range
+            case riak_kv_ts_api:compile_to_per_quantum_queries(Mod,
+                                                               SQL?SQL_SELECT{cover_context=R}) of
                 {ok, Compiled} ->
                     Bucket = riak_kv_ts_util:table_to_bucket(Table),
                     {reply,
-                     {tscoverageresp, riak_kv_ts_util:sql_to_cover(Client, Compiled, Bucket, [])},
+                     {tscoverageresp,
+                      riak_kv_ts_util:sql_to_cover(Client, Compiled, Bucket, R, U, [])},
                      State};
                 {error, Reason} ->
                     {reply, make_rpberrresp(

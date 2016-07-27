@@ -31,12 +31,13 @@
          get_column_types/2,
          get_table_ddl/1,
          lk/1,
+         lk_to_pk/3,
          make_ts_keys/3,
          maybe_parse_table_def/2,
          pk/1,
          queried_table/1,
          sql_record_to_tuple/1,
-         sql_to_cover/4,
+         sql_to_cover/6,
          table_to_bucket/1,
          validate_rows/2,
          row_to_key/3
@@ -242,43 +243,58 @@ try_compile_ddl(DDL) ->
 
 
 -spec make_ts_keys([riak_pb_ts_codec:ldbvalue()], ?DDL{}, module()) ->
-                          {ok, {binary(), binary()}} |
+                          {ok, {tuple(), tuple()}} |
                           {error, {bad_key_length, integer(), integer()}}.
 %% Given a list of values (of appropriate types) and a DDL, produce a
 %% partition and local key pair, which can be used in riak_client:get
 %% to fetch TS objects.
-make_ts_keys(CompoundKey, DDL = ?DDL{local_key = #key_v1{ast = LKParams},
+make_ts_keys(CompoundKey, DDL = ?DDL{local_key = #key_v1{ast = LKAst},
                                      fields = Fields}, Mod) ->
     %% 1. use elements in Key to form a complete data record:
-    KeyFields = [F || #param_v1{name = [F]} <- LKParams],
+    KeyFields = [F || #param_v1{name = [F]} <- LKAst],
+    AllFields = [F || #riak_field_v1{name = F} <- Fields],
     Got = length(CompoundKey),
     Need = length(KeyFields),
     case {Got, Need} of
         {_N, _N} ->
-            KeyAssigned = lists:zip(KeyFields, CompoundKey),
-            VoidRecord = [{F, void} || #riak_field_v1{name = F} <- Fields],
-            %% (void values will not be looked at in riak_ql_ddl:make_key;
-            %% only LK-constituent fields matter)
-            BareValues =
-                list_to_tuple(
-                  [proplists:get_value(K, KeyAssigned)
-                   || {K, _} <- VoidRecord]),
-
+            DummyObject = build_dummy_object_from_keyed_values(
+                            lists:zip(KeyFields, CompoundKey), AllFields),
             %% 2. make the PK and LK
             PK  = encode_typeval_key(
-                    riak_ql_ddl:get_partition_key(DDL, BareValues, Mod)),
+                    riak_ql_ddl:get_partition_key(DDL, DummyObject, Mod)),
             LK  = encode_typeval_key(
-                    riak_ql_ddl:get_local_key(DDL, BareValues, Mod)),
+                    riak_ql_ddl:get_local_key(DDL, DummyObject, Mod)),
             {ok, {PK, LK}};
        {G, N} ->
             {error, {bad_key_length, G, N}}
     end.
+
+build_dummy_object_from_keyed_values(LK, AllFields) ->
+    VoidRecord = [{F, void} || F <- AllFields],
+    %% (void values will not be looked at in riak_ql_ddl:make_key;
+    %% only LK-constituent fields matter)
+    list_to_tuple(
+      [proplists:get_value(K, LK)
+       || {K, _} <- VoidRecord]).
+
 
 -spec encode_typeval_key(list({term(), term()})) -> tuple().
 %% Encode a time series key returned by riak_ql_ddl:get_partition_key/3,
 %% riak_ql_ddl:get_local_key/3,
 encode_typeval_key(TypeVals) ->
     list_to_tuple([Val || {_Type, Val} <- TypeVals]).
+
+-spec lk_to_pk(tuple(), ?DDL{}, module()) -> tuple().
+%% A simplified version of make_key/3 which only returns the PK.
+lk_to_pk(LKVals, DDL = ?DDL{local_key = #key_v1{ast = LKAst},
+                        fields = Fields}, Mod)
+  when is_tuple(LKVals) andalso size(LKVals) == length(LKAst) ->
+    KeyFields = [F || #param_v1{name = [F]} <- LKAst],
+    AllFields = [F || #riak_field_v1{name = F} <- Fields],
+    DummyObject = build_dummy_object_from_keyed_values(
+                    lists:zip(KeyFields, tuple_to_list(LKVals)), AllFields),
+    encode_typeval_key(
+      riak_ql_ddl:get_partition_key(DDL, DummyObject, Mod)).
 
 %% Print the query explanation to the shell.
 explain_query_print(QueryString) ->
@@ -384,7 +400,7 @@ get_column_types(ColumnNames, Mod) ->
     [Mod:get_field_type([N]) || N <- ColumnNames].
 
 row_to_key(Row, DDL, Mod) ->
-    riak_kv_ts_util:encode_typeval_key(
+    encode_typeval_key(
       riak_ql_ddl:get_partition_key(DDL, Row, Mod)).
 
 %% Result from riak_client:get_cover is a nested list of coverage plan
@@ -393,9 +409,9 @@ row_to_key(Row, DDL, Mod) ->
 
 %% If any of the results from get_cover are errors, we want that tuple
 %% to be the sole return value
-sql_to_cover(_Client, [], _Bucket, Accum) ->
+sql_to_cover(_Client, [], _Bucket, _Replace, _Unavail, Accum) ->
     lists:reverse(Accum);
-sql_to_cover(Client, [SQL|Tail], Bucket, Accum) ->
+sql_to_cover(Client, [SQL|Tail], Bucket, undefined, _Unavail, Accum) ->
     case Client:get_cover(riak_kv_qry_coverage_plan, Bucket, undefined,
                           {SQL, Bucket}) of
         {error, Error} ->
@@ -404,10 +420,60 @@ sql_to_cover(Client, [SQL|Tail], Bucket, Accum) ->
             {Description, SubRange} = reverse_sql(SQL),
             Node = proplists:get_value(node, Cover),
             {IP, Port} = riak_kv_pb_coverage:node_to_pb_details(Node),
+
+            %% As of 1.3, coverage chunks returned to the client for
+            %% KV are a simple proplist, but for TS are a tuple with
+            %% the first element the proplist, and the 2nd element a
+            %% representation of the quantum to which this chunk
+            %% applies.
+            %%
+            %% The fact that the structures are unnecessarily
+            %% different results in some awkwardness when interpreting
+            %% them. See `riak_client:replace_cover' for an example.
+            %%
+            %% As of 1.6 or post-merge equivalent (so that mixed
+            %% clusters with 1.3 are not supported), the SubRange
+            %% value should be added to the cover proplist instead of
+            %% creating this clumsy tuple so that cover chunks are
+            %% simple proplists for all types of coverage queries.
+            %%
+            %% See also `riak_kv_qry_compiler:unwrap_cover/1' for the
+            %% code that will interpret the proplists properly as of
+            %% 1.4 and later.
+            %%
+            %% The 2nd field in the tuple that is returned by
+            %% `reverse_sql/1' is itself a tuple with two elements:
+            %% the name of the quantum field and the relevant range
+            %% for this chunk.
+            %%
+            %% So the code to implement with 1.6 would be roughly:
+            %% Context = term_to_checksum_binary(Cover ++
+            %%     [{ts_where_field, element(1, SubRange)},
+            %%      {ts_where_range, element(2, SubRange)}]).
+            %%
+            %% (Real code would be pattern-matchy and generally cleaner.)
+
             Context = riak_kv_pb_coverage:term_to_checksum_binary({Cover, SubRange}),
             Entry = {{IP, Port}, Context, SubRange, Description},
-            sql_to_cover(Client, Tail, Bucket, [Entry|Accum])
+            sql_to_cover(Client, Tail, Bucket, undefined, [], [Entry|Accum])
+    end;
+sql_to_cover(Client, [SQL|Tail], Bucket, Replace, Unavail, Accum) ->
+    case Client:replace_cover(riak_kv_qry_coverage_plan, Bucket, undefined,
+                              riak_kv_pb_coverage:checksum_binary_to_term(Replace),
+                              lists:map(fun riak_kv_pb_coverage:checksum_binary_to_term/1,
+                                        Unavail),
+                              [{SQL, Bucket}]) of
+        {error, Error} ->
+            {error, Error};
+        [Cover] ->
+            {Description, SubRange} = reverse_sql(SQL),
+            Node = proplists:get_value(node, Cover),
+            {IP, Port} = riak_kv_pb_coverage:node_to_pb_details(Node),
+            Context = riak_kv_pb_coverage:term_to_checksum_binary({Cover, SubRange}),
+            Entry = {{IP, Port}, Context, SubRange, Description},
+            sql_to_cover(Client, Tail, Bucket, Replace, Unavail, [Entry|Accum])
     end.
+
 
 
 %% Generate a human-readable description of the target

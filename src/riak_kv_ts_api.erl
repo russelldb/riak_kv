@@ -28,6 +28,7 @@
 -export([
          api_call_from_sql_type/1,
          api_call_to_perm/1,
+         api_calls/0,
          put_data/2, put_data/3,
          get_data/2, get_data/3, get_data/4,
          delete_data/2, delete_data/3, delete_data/4, delete_data/5,
@@ -46,7 +47,7 @@
 
 %% external API calls enumerated
 -type query_api_call() :: query_create_table | query_select | query_describe | query_insert.
--type api_call() :: get | put | delete | listkeys | coverage | query_api_call().
+-type api_call() :: get | put | delete | list_keys | coverage | query_api_call().
 -export_type([query_api_call/0, api_call/0]).
 
 -spec api_call_from_sql_type(riak_kv_qry:query_type()) -> query_api_call().
@@ -62,8 +63,8 @@ api_call_to_perm(put) ->
     "riak_ts.put";
 api_call_to_perm(delete) ->
     "riak_ts.delete";
-api_call_to_perm(listkeys) ->
-    "riak_ts.listkeys";
+api_call_to_perm(list_keys) ->
+    "riak_ts.list_keys";
 api_call_to_perm(coverage) ->
     "riak_ts.coverage";
 api_call_to_perm(query_create_table) ->
@@ -71,7 +72,16 @@ api_call_to_perm(query_create_table) ->
 api_call_to_perm(query_select) ->
     "riak_ts.query_select";
 api_call_to_perm(query_describe) ->
-    "riak_ts.query_describe".
+    "riak_ts.query_describe";
+%% INSERT query is a put, so let's cal it that
+api_call_to_perm(query_insert) ->
+    api_call_to_perm(put).
+
+%%
+-spec api_calls() -> [api_call()].
+api_calls() ->
+    [query_create_table, query_select, query_describe, query_insert,
+     get, put, delete, list_keys, coverage].
 
 
 -spec query(string() | riak_kv_qry:sql_query_type_record(), ?DDL{}) ->
