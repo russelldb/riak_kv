@@ -59,6 +59,7 @@ init([]) ->
     Type = worker,
 
     NumFSMs = app_helper:get_env(riak_kv, timeseries_max_concurrent_queries),
+    io:format("[EMLDEBUG] timeseries_max_concurrent_queries = ~p~n", [NumFSMs]),
     MaxQ    = 3,
 
     MakeNamesFn = fun(N) ->
