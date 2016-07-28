@@ -235,7 +235,7 @@ do_select(SQL, ?DDL{table = BucketType} = DDL) ->
     Mod = riak_ql_ddl:make_module_name(BucketType),
     MaxSubQueries =
         app_helper:get_env(riak_kv, timeseries_query_max_quanta_span),
-    io:format("[EMLDEBUG] timeseries_query_max_quanta_span = ~p~n", [MaxSubQueries]),
+
     case riak_ql_ddl:is_query_valid(Mod, DDL, riak_kv_ts_util:sql_record_to_tuple(SQL)) of
         true ->
             case riak_kv_qry_compiler:compile(DDL, SQL, MaxSubQueries) of
