@@ -22,7 +22,9 @@
 %% API
 -export([add_conditional_postcommit/1,
          del_conditional_postcommit/1,
-         get_conditional_postcommit/2]).
+         get_conditional_hooks/3,
+         add_conditional_precommit/1,
+         del_conditional_precommit/1]).
 
 %% Exported for internal use by `riak_kv_sup'
 -export([create_table/0]).
@@ -64,20 +66,37 @@ del_conditional_postcommit(Hook) ->
     del_hook(conditional_postcommit, Hook).
 
 %% @doc
-%% This function invokes each registered conditional postcommit
+%% This function invokes each registered conditional commit
 %% hook. Each hook will return either `false' or a list of active
 %% hooks. This function then returns the combined list of active hooks.
--spec get_conditional_postcommit({bucket(), key()}, bucket_props()) -> [any()].
-get_conditional_postcommit({{BucketType, Bucket}, _Key}, BucketProps) ->
-    Hooks = get_hooks(conditional_postcommit),
+-spec get_conditional_hooks(conditional_precommit | conditional_postcommit,
+        {bucket(), key()}, bucket_props()) -> [any()].
+get_conditional_hooks(Type, {{BucketType, Bucket}, _Key}, BucketProps) ->
+    HookType = get_hook_type_from_type(Type),
+    Hooks = get_hooks(HookType),
     ActiveHooks =
         [ActualHook || {Mod, Fun} <- Hooks,
                        ActualHook <- [Mod:Fun(BucketType, Bucket, BucketProps)],
                        ActualHook =/= false],
     lists:flatten(ActiveHooks);
-get_conditional_postcommit(_BKey, _BucketProps) ->
+get_conditional_hooks(_Type, _BKey, _BucketProps) ->
     %% For now, we only support typed buckets.
     [].
+
+%% @doc
+%% Add a global conditional precommit hook that is called for each
+%% PUT operation. The hook is of the form `{Module, Fun}'. The specified
+%% function is called with the relevent bucket, key, and bucket properties
+%% at the time of the PUT operation and is expected to return `false' or
+%% a normal precommit hook specification that should be invoked.
+-spec add_conditional_precommit(hook()) -> ok.
+add_conditional_precommit(Hook) ->
+    add_hook(conditional_precommit, Hook).
+
+%% @doc Remove a previously registered conditional precommit hook
+-spec del_conditional_precommit(hook()) -> ok.
+del_conditional_precommit(Hook) ->
+    del_hook(conditional_precommit, Hook).
 
 %%%===================================================================
 
@@ -124,3 +143,8 @@ restore_state() ->
             true = ets:insert_new(?MODULE, Hooks),
             ok
     end.
+
+get_hook_type_from_type(postcommit) ->
+    conditional_postcommit;
+get_hook_type_from_type(precommit) ->
+    conditional_precommit.

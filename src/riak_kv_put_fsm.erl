@@ -433,7 +433,7 @@ validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
             Precommit =
                 if Disable -> [];
                    true ->
-                        L = get_hooks(precommit, BucketProps),
+                        L = get_hooks(precommit, BucketProps, StateData0),
                         L ++ [?PARSE_INDEX_PRECOMMIT]
                 end,
             Postcommit =
@@ -831,6 +831,7 @@ handle_options([{_,_}|T], Acc) -> handle_options(T, Acc).
 %% Where Called = {Mod, Fun} if Lang = erlang
 %%       Called = JSName if Lang = javascript
 invoke_hook({struct, Hook}=HookDef, RObj) ->
+    lager:info("attempting to invoke the hook: ~p", [Hook]),
     Mod = get_option(<<"mod">>, Hook),
     Fun = get_option(<<"fun">>, Hook),
     JSName = get_option(<<"name">>, Hook),
@@ -962,7 +963,6 @@ decode_postcommit({error, {invalid_hook_def, Def}}, Trace) ->
     ok = riak_kv_stat:update(postcommit_fail),
     lager:debug("Invalid post-commit hook definition ~p", [Def]).
 
-
 get_hooks(HookType, BucketProps) ->
     Hooks = get_option(HookType, BucketProps, []),
     case Hooks of
@@ -972,9 +972,9 @@ get_hooks(HookType, BucketProps) ->
             Hooks
     end.
 
-get_hooks(postcommit, BucketProps, #state{bkey=BKey}) ->
-    BaseHooks = get_hooks(postcommit, BucketProps),
-    CondHooks = riak_kv_hooks:get_conditional_postcommit(BKey, BucketProps),
+get_hooks(Type, BucketProps, #state{bkey=BKey}) ->
+    BaseHooks = get_hooks(Type, BucketProps),
+    CondHooks = riak_kv_hooks:get_conditional_hooks(Type, BKey, BucketProps),
     BaseHooks ++ (CondHooks -- BaseHooks).
 
 get_option(Name, Options) ->
