@@ -831,7 +831,6 @@ handle_options([{_,_}|T], Acc) -> handle_options(T, Acc).
 %% Where Called = {Mod, Fun} if Lang = erlang
 %%       Called = JSName if Lang = javascript
 invoke_hook({struct, Hook}=HookDef, RObj) ->
-    lager:info("attempting to invoke the hook: ~p", [Hook]),
     Mod = get_option(<<"mod">>, Hook),
     Fun = get_option(<<"fun">>, Hook),
     JSName = get_option(<<"name">>, Hook),
