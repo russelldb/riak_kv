@@ -29,12 +29,12 @@
 %% For dialyzer types
 -include_lib("riak_ql/include/riak_ql_ddl.hrl").
 
--define(SQL_SELECT, #riak_select_v1).
--define(SQL_SELECT_RECORD_NAME, riak_select_v1).
+-define(SQL_SELECT, #riak_select_v2).
+-define(SQL_SELECT_RECORD_NAME, riak_select_v2).
 
 %% the result type of a query, rows means to return all matching rows, aggregate
 %% returns one row calculated from the result set for the query.
--type select_result_type() :: rows | aggregate.
+-type select_result_type() :: rows | aggregate | group_by.
 
 -record(riak_sel_clause_v1,
         {
@@ -46,6 +46,7 @@
           finalisers       = []   :: [skip | function()]
         }).
 
+-define(GROUP_BY_DEFAULT, []).
 -record(riak_select_v1,
         {
           'SELECT'              :: #riak_sel_clause_v1{},
@@ -60,7 +61,27 @@
           is_executable = false :: boolean(),
           type          = sql   :: sql | timeseries,
           cover_context = undefined :: term(), %% for parallel queries
-          local_key                            %% prolly a mistake to put this here - should be in DDL
+          %% prolly a mistake to put this here - should be in DDL
+          local_key
+        }).
+-record(riak_select_v2,
+        {
+          'SELECT'              :: #riak_sel_clause_v1{},
+          'FROM'        = <<>>  :: binary() | {list, [binary()]} | {regex, list()},
+          'WHERE'       = []    :: [riak_ql_ddl:filter()],
+          'ORDER BY'    = []    :: [riak_kv_qry_compiler:sorter()],
+          'LIMIT'       = []    :: [riak_kv_qry_compiler:limit()],
+          helper_mod            :: atom(),
+          %% will include groups when we get that far
+          partition_key = none  :: none | #key_v1{},
+          %% indicates whether this query has already been compiled to a sub query
+          is_executable = false :: boolean(),
+          type          = sql   :: sql | timeseries,
+          cover_context = undefined :: term(), %% for parallel queries
+          %% prolly a mistake to put this here - should be in DDL
+          local_key,
+          %% since v2
+          group_by = ?GROUP_BY_DEFAULT :: [{identifier, binary()}] | [{FieldPos::integer(), FieldName::binary()}]
         }).
 
 -record(riak_sql_describe_v1,
@@ -74,6 +95,16 @@
           fields                :: [riak_ql_ddl:field_identifier()],
           values                :: [[riak_ql_ddl:data_value()]],
           helper_mod            :: atom()
+        }).
+
+-record(riak_sql_show_tables_v1,
+        {
+            'SHOW_TABLES' = <<>>  :: binary()
+        }).
+
+-record(riak_sql_explain_query_v1,
+        {
+            'EXPLAIN' = ?SQL_SELECT{} :: ?SQL_SELECT{}
         }).
 
 -endif.

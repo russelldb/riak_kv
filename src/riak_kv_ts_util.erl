@@ -28,6 +28,7 @@
          apply_timeseries_bucket_props/3,
          build_sql_record/3,
          encode_typeval_key/1,
+         explain_query/1, explain_query/2,
          get_column_types/2,
          get_table_ddl/1,
          lk/1,
@@ -36,15 +37,17 @@
          maybe_parse_table_def/2,
          pk/1,
          queried_table/1,
+         row_to_key/3,
          sql_record_to_tuple/1,
          sql_to_cover/6,
          table_to_bucket/1,
-         validate_rows/2,
-         row_to_key/3
+         validate_rows/2
         ]).
--export([explain_query/1, explain_query/2]).
--export([explain_query_print/1]).
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-compile(export_all).
+-endif.
 
 %% NOTE on table_to_bucket/1: Clients will work with table
 %% names. Those names map to a bucket type/bucket name tuple in Riak,
@@ -65,29 +68,46 @@ sql_record_to_tuple(?SQL_SELECT{'FROM'   = From,
                                 'WHERE'  = Where}) ->
     {From, Select, Where}.
 
+build_sql_record(Command, SQL, Cover) ->
+    try build_sql_record_int(Command, SQL, Cover) of
+        Return -> Return
+    catch
+        throw:Atom ->
+            {error, Atom}
+    end.
+
 %% Convert the proplist obtained from the QL parser
-build_sql_record(select, SQL, Cover) ->
+build_sql_record_int(select, SQL, Cover) ->
     T = proplists:get_value(tables, SQL),
     F = proplists:get_value(fields, SQL),
     L = proplists:get_value(limit, SQL),
     W = proplists:get_value(where, SQL),
+    GroupBy = proplists:get_value(group_by, SQL),
     case is_binary(T) of
         true ->
+            Mod = riak_ql_ddl:make_module_name(T),
             {ok,
              ?SQL_SELECT{'SELECT'   = #riak_sel_clause_v1{clause = F},
                          'FROM'     = T,
-                         'WHERE'    = W,
+                         'WHERE'    = convert_where_timestamps(Mod, W),
                          'LIMIT'    = L,
-                         helper_mod = riak_ql_ddl:make_module_name(T),
-                         cover_context = Cover}
+                         helper_mod = Mod,
+                         cover_context = Cover,
+                         group_by = GroupBy }
             };
         false ->
             {error, <<"Must provide exactly one table name">>}
     end;
-build_sql_record(describe, SQL, _Cover) ->
+build_sql_record_int(explain, SQL, Cover) ->
+    case build_sql_record_int(select, SQL, Cover) of
+        {ok, Select} ->
+            {ok, #riak_sql_explain_query_v1{'EXPLAIN' = Select }};
+        Error -> Error
+    end;
+build_sql_record_int(describe, SQL, _Cover) ->
     D = proplists:get_value(identifier, SQL),
     {ok, #riak_sql_describe_v1{'DESCRIBE' = D}};
-build_sql_record(insert, SQL, _Cover) ->
+build_sql_record_int(insert, SQL, _Cover) ->
     T = proplists:get_value(table, SQL),
     case is_binary(T) of
         true ->
@@ -97,13 +117,120 @@ build_sql_record(insert, SQL, _Cover) ->
             V = proplists:get_value(values, SQL),
             {ok, #riak_sql_insert_v1{'INSERT'   = T,
                                      fields     = F,
-                                     values     = V,
+                                     values     = convert_insert_timestamps(Mod, F, V),
                                      helper_mod = Mod
                                     }};
         false ->
             {error, <<"Must provide exactly one table name">>}
+    end;
+build_sql_record_int(show_tables, _SQL, _Cover) ->
+    {ok, #riak_sql_show_tables_v1{}}.
+
+convert_where_timestamps(_Mod, []) ->
+    [];
+convert_where_timestamps(Mod, Where) ->
+    [replace_ast_timestamps(Mod, hd(Where))].
+
+replace_ast_timestamps(Mod, {Op, Item1, Item2}) when is_tuple(Item1) andalso is_tuple(Item2) ->
+    {Op, replace_ast_timestamps(Mod, Item1), replace_ast_timestamps(Mod, Item2)};
+replace_ast_timestamps(Mod, {Op, FieldName, {binary, Value}}) ->
+    {Op, FieldName, maybe_convert_to_epoch(catch Mod:get_field_type([FieldName]), Value, Op)};
+replace_ast_timestamps(_Mod, {Op, Item1, Item2}) ->
+    {Op, Item1, Item2}.
+
+do_epoch(String, CompleteFun, PostCompleteFun, Exponent) ->
+    Normal = timestamp_to_normalized(String),
+    case jam:is_valid(Normal) of
+        false ->
+            throw(<<"Invalid date/time string">>);
+        true ->
+            ok
+    end,
+    Epoch = case jam:is_complete(Normal) of
+                true ->
+                    jam:to_epoch(Normal, Exponent);
+                false ->
+                    PostCompleteFun(jam:to_epoch(CompleteFun(Normal), Exponent))
+            end,
+    case is_atom(Epoch) of
+        true ->
+            %% jam returns atoms if processing gives an error
+            throw(Epoch);
+        false ->
+            Epoch
     end.
 
+maybe_convert_to_epoch({'EXIT', _}, Value, _Op) ->
+    {binary, Value};
+maybe_convert_to_epoch(timestamp, Value, Op) when Op == '>'; Op == '<=' ->
+    %% For strictly greater-than or less-than-equal-to, we increment
+    %% any incomplete date/time strings by one "unit", where the unit
+    %% is the least significant value provided by the user. "2016"
+    %% becomes "2017". "2016-07-05T11" becomes "2016-07-05T12".
+    %%
+    %% The result is then decremented by 1ms to maintain the proper
+    %% semantics. The alternative would be to convert the operator in
+    %% the syntax tree (from > to >=, or from <= to <).
+    CompleteFun = fun(DT) -> jam:expand(jam:increment(DT, 1), second) end,
+    PostCompleteFun = fun(Epoch) -> Epoch - 1 end,
+    {integer, do_epoch(Value, CompleteFun, PostCompleteFun, 3)};
+maybe_convert_to_epoch(timestamp, Value, _Op) ->
+    CompleteFun = fun(DT) -> jam:expand(DT, second) end,
+    PostCompleteFun = fun(Epoch) -> Epoch end,
+    {integer, do_epoch(Value, CompleteFun, PostCompleteFun, 3)};
+maybe_convert_to_epoch(_Type, Value, _Op) ->
+    {binary, Value}.
+
+convert_insert_timestamps(Mod, Fields, Rows) ->
+    lists:map(fun(Row) -> row_timestamp_translation(Mod, Fields, Row) end,
+              Rows).
+
+row_timestamp_translation(Mod, Fields, Row) ->
+    Types = lists:map(fun({identifier, [Column]}) ->
+                              catch Mod:get_field_type([Column])
+                      end, Fields),
+    TypeMap = lists:zip(Row, Types),
+
+    CompleteFun = fun(DT) -> jam:expand(DT, second) end,
+    PostCompleteFun = fun(Epoch) -> Epoch end,
+    lists:map(fun({binary, String}=Value) ->
+                      case lists:keyfind(Value, 1, TypeMap) of
+                          {Value, timestamp} ->
+                              {integer, do_epoch(String, CompleteFun,
+                                                 PostCompleteFun, 3)};
+                          _ ->
+                              Value
+                      end;
+                 (Value) ->
+                      Value
+              end, Row).
+
+get_default_timezone(Default) ->
+    try
+        riak_core_metadata:get({riak_core, timezone},
+                               string, [{default, Default}])
+            of
+        Value ->
+            Value
+    catch
+        _:_ -> Default
+    end.
+
+timestamp_to_normalized(Str) ->
+    ProcessOptions =
+        [
+         {default_timezone, get_default_timezone("+00")}
+        ],
+    Normal = jam:normalize(
+               jam:compile(
+                 jam_iso8601:parse(Str), ProcessOptions)
+              ),
+    case Normal of
+        undefined ->
+            throw(<<"Invalid date/time string">>);
+        _ ->
+            Normal
+    end.
 
 %% Useful key extractors for functions (e.g., in get or delete code
 %% paths) which are agnostic to whether they are dealing with TS or
@@ -128,8 +255,11 @@ table_to_bucket(Table) when is_binary(Table) ->
 queried_table(?DDL{table = Table}) -> Table;
 queried_table(#riak_sql_describe_v1{'DESCRIBE' = Table}) -> Table;
 queried_table(?SQL_SELECT{'FROM' = Table})               -> Table;
-queried_table(#riak_sql_insert_v1{'INSERT' = Table})     -> Table.
-
+queried_table(#riak_sql_insert_v1{'INSERT' = Table})     -> Table;
+queried_table(#riak_sql_show_tables_v1{})                -> <<>>;
+queried_table(
+    #riak_sql_explain_query_v1{'EXPLAIN'=?SQL_SELECT{'FROM' = Table}}) ->
+        Table.
 
 -spec get_table_ddl(binary()) ->
                            {ok, module(), ?DDL{}} |
@@ -251,7 +381,7 @@ try_compile_ddl(DDL) ->
 make_ts_keys(CompoundKey, DDL = ?DDL{local_key = #key_v1{ast = LKAst},
                                      fields = Fields}, Mod) ->
     %% 1. use elements in Key to form a complete data record:
-    KeyFields = [F || #param_v1{name = [F]} <- LKAst],
+    KeyFields = [F || ?SQL_PARAM{name = [F]} <- LKAst],
     AllFields = [F || #riak_field_v1{name = F} <- Fields],
     Got = length(CompoundKey),
     Need = length(KeyFields),
@@ -289,23 +419,12 @@ encode_typeval_key(TypeVals) ->
 lk_to_pk(LKVals, DDL = ?DDL{local_key = #key_v1{ast = LKAst},
                         fields = Fields}, Mod)
   when is_tuple(LKVals) andalso size(LKVals) == length(LKAst) ->
-    KeyFields = [F || #param_v1{name = [F]} <- LKAst],
+    KeyFields = [F || ?SQL_PARAM{name = [F]} <- LKAst],
     AllFields = [F || #riak_field_v1{name = F} <- Fields],
     DummyObject = build_dummy_object_from_keyed_values(
                     lists:zip(KeyFields, tuple_to_list(LKVals)), AllFields),
     encode_typeval_key(
       riak_ql_ddl:get_partition_key(DDL, DummyObject, Mod)).
-
-%% Print the query explanation to the shell.
-explain_query_print(QueryString) ->
-    explain_query_print2(1, explain_query(QueryString)).
-
-explain_query_print2(_, []) ->
-    ok;
-explain_query_print2(Index, [{Start, End, Filter}|Tail]) ->
-    io:format("SUB QUERY ~p~n~s ~s~n~s~n",
-        [Index,Start,filter_to_string(Filter),End]),
-    explain_query_print2(Index+1, Tail).
 
 %% Show some debug info about how a query is compiled into sub queries
 %% and what key ranges are created.
@@ -320,11 +439,21 @@ explain_query(QueryString) ->
 %%
 %% Have a flexible API because it is a debugging function.
 explain_query(DDL, ?SQL_SELECT{} = Select) ->
-    {ok, SubQueries} = riak_kv_qry_compiler:compile(DDL, Select, 10000),
-    [explain_sub_query(SQ) || SQ <- SubQueries];
+    case riak_kv_qry_compiler:compile(DDL, Select, 10000) of
+        {ok, SubQueries} ->
+            {_Total, Rows} = lists:foldl(fun index_subquery/2, {1,[]}, SubQueries),
+            lists:reverse(Rows);
+        Error ->
+            Error
+    end;
 explain_query(DDL, QueryString) ->
     {ok, Select} = explain_compile_query(QueryString),
     explain_query(DDL, Select).
+
+%%
+index_subquery(SQ, {Idx, Acc}) ->
+    Row = explain_sub_query(Idx, SQ),
+    {Idx + 1, [Row | Acc]}.
 
 %%
 explain_compile_query(QueryString) ->
@@ -332,44 +461,45 @@ explain_compile_query(QueryString) ->
     build_sql_record(select, Q, undefined).
 
 %%
-explain_sub_query(#riak_select_v1{ 'WHERE' = SubQueryWhere }) ->
+explain_sub_query(Index, ?SQL_SELECT{ 'WHERE' = SubQueryWhere }) ->
     {_, StartKey1} = lists:keyfind(startkey, 1, SubQueryWhere),
     {_, EndKey1} = lists:keyfind(endkey, 1, SubQueryWhere),
     {_, Filter} = lists:keyfind(filter, 1, SubQueryWhere),
-    StartKey2 = [[key_element_to_string(V), $/] || {_,_,V} <- StartKey1],
-    EndKey2 = [[key_element_to_string(V), $/] || {_,_,V} <- EndKey1],
-    case lists:keyfind(start_inclusive, 1, SubQueryWhere) of
-        {start_inclusive,true} ->
-            StartKey3 = [">= ", StartKey2];
-        _ ->
-            StartKey3 = [">  ", StartKey2]
-    end,
-    case lists:keyfind(end_inclusive, 1, SubQueryWhere) of
-        {end_inclusive,true} ->
-            EndKey3 = ["<= ", EndKey2];
-        _ ->
-            EndKey3 = ["<  ", EndKey2]
-    end,
-    {StartKey3, EndKey3, Filter}.
+    StartKey2 = string:join([key_to_string(Key) || Key <- StartKey1], ", "),
+    EndKey2 = string:join([key_to_string(Key) || Key <- EndKey1], ", "),
+    StartInclusive = lists:keymember(start_inclusive, 1, StartKey1),
+    EndInclusive = lists:keymember(end_inclusive, 1, EndKey1),
+    [Index, StartKey2, StartInclusive, EndKey2, EndInclusive, filter_to_string(Filter)].
 
 %%
-key_element_to_string(V) when is_binary(V) -> varchar_quotes(V);
+key_element_to_string(V) when is_binary(V) -> binary_to_list(V);
 key_element_to_string(V) when is_float(V) -> mochinum:digits(V);
-key_element_to_string(V) -> io_lib:format("~p", [V]).
+key_element_to_string(V) -> lists:flatten(io_lib:format("~p", [V])).
 
 %%
+%% This one quotes values which should be quoted for assignment
+element_to_quoted_string(V) when is_binary(V) -> varchar_quotes(V);
+element_to_quoted_string(V) when is_float(V) -> mochinum:digits(V);
+element_to_quoted_string(V) -> lists:flatten(io_lib:format("~p", [V])).
+
+%%
+-spec key_to_string({binary(),any(),term()}) -> string().
+key_to_string({Field, _Op, Value}) ->
+    lists:flatten(io_lib:format("~s = ~s",
+        [key_element_to_string(Field), element_to_quoted_string(Value)])).
+
+%%
+-spec filter_to_string([]| {const,any()} | {atom(),any(),any()}) ->
+    string().
 filter_to_string([]) ->
-    "NO FILTER";
-filter_to_string(Filter) ->
-    ["FILTER ", filter_to_string2(Filter)].
-
-%%
-filter_to_string2({const,V}) ->
+    [];
+filter_to_string({const,V}) ->
+    element_to_quoted_string(V);
+filter_to_string({field,V,_}) ->
     key_element_to_string(V);
-filter_to_string2({field,V,_}) ->
-    V;
-filter_to_string2({Op, A, B}) ->
-    [filter_to_string2(A), op_to_string(Op), filter_to_string2(B)].
+filter_to_string({Op, A, B}) ->
+    lists:flatten(io_lib:format("(~s~s~s)",
+        [filter_to_string(A), op_to_string(Op), filter_to_string(B)])).
 
 %%
 op_to_string(and_) -> " AND ";
@@ -377,8 +507,8 @@ op_to_string(or_) -> " OR ";
 op_to_string(Op) -> " " ++ atom_to_list(Op) ++ " ".
 
 %%
-varchar_quotes(V) ->
-    <<"'", V/binary, "'">>.
+varchar_quotes(V) when is_binary(V) ->
+    lists:flatten(io_lib:format("'~s'", [V])).
 
 %% Give validate_rows/2 a DDL Module and a list of decoded rows,
 %% and it will return a list of invalid rows indexes.
@@ -517,7 +647,7 @@ extract_time_boundaries(FieldName, WhereList) ->
 identify_quantum_field(#key_v1{ast = KeyList}) ->
     HashFn = find_hash_fn(KeyList),
     P_V1 = hd(HashFn#hash_fn_v1.args),
-    hd(P_V1#param_v1.name).
+    hd(P_V1?SQL_PARAM.name).
 
 find_hash_fn([]) ->
     throw(wtf);
@@ -537,7 +667,6 @@ flat_format(Format, Args) ->
 %%%
 
 -ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
 
 helper_compile_def_to_module(SQL) ->
     Lexed = riak_ql_lexer:get_tokens(SQL),
@@ -637,5 +766,112 @@ validate_rows_bad_2_test() ->
         [1, 3, 4],
         validate_rows(Mod, [{}, {<<"f">>, <<"s">>, 11}, {a, <<"s">>, 12}, {"hithere"}])
     ).
+
+bad_timestamp_select_test() ->
+    BadFormat = "20151T10",
+    BadQuery = lists:flatten(
+                 io_lib:format("select * from table1 "
+                               "where b > '~s' and "
+                               " b < '20151013T20:00:00'", [BadFormat])),
+    {_DDL, _Mod} = helper_compile_def_to_module(
+        "CREATE TABLE table1 ("
+        "a SINT64 NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "c SINT64 NOT NULL, "
+        "PRIMARY KEY((a, quantum(b, 15, 's')), a, b))"),
+    Lexed = riak_ql_lexer:get_tokens(BadQuery),
+    {ok, Q} = riak_ql_parser:parse(Lexed),
+    ?assertMatch({error, <<"Invalid date/time string">>},
+                 build_sql_record(select, Q, undefined)).
+
+good_timestamp_select_test() ->
+    GoodQuery = "select * from table1 "
+        " where b > '20151013T18:30' and "
+        " b <= '20151013T19' ",
+    {_DDL, _Mod} = helper_compile_def_to_module(
+        "CREATE TABLE table1 ("
+        "a SINT64 NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "c SINT64 NOT NULL, "
+        "PRIMARY KEY((a, quantum(b, 15, 's')), a, b))"),
+    Lexed = riak_ql_lexer:get_tokens(GoodQuery),
+    {ok, Q} = riak_ql_parser:parse(Lexed),
+    {ok, Select} = build_sql_record(select, Q, undefined),
+    Where = Select?SQL_SELECT.'WHERE',
+    %% Navigate the tree looking for integer values for b
+    %% comparisons. Verify that we find both (hence `2' as our
+    %% equality)
+    ?assertEqual(2,
+                 check_integer_timestamps(
+                   hd(Where),
+                   %% The first value, the lower bound, is
+                   %% 20151013T18:31:00 (- 1ms) because of the
+                   %% incomplete datetime string. The upper bound is
+                   %% 20151013T20:00:00 (- 1ms) for the same reason.
+                   1444761059999,
+                   1444766399999)).
+
+%% This is not a general-purpose tool, it is tuned specifically to the
+%% needs of `good_timestamp_select_test'.
+check_integer_timestamps({_Op, A, B}, Lower, Upper) when is_tuple(A), is_tuple(B) ->
+    check_integer_timestamps(A, Lower, Upper) +
+        check_integer_timestamps(B, Lower, Upper);
+check_integer_timestamps({'<=', <<"b">>, Compare}, _Lower, Upper) ->
+    ?assertEqual({integer, Upper}, Compare),
+    1;
+check_integer_timestamps({'>', <<"b">>, Compare}, Lower, _Upper) ->
+    ?assertEqual({integer, Lower}, Compare),
+    1;
+check_integer_timestamps(_, _, _) ->
+    0.
+
+good_timestamp_insert_test() ->
+    GoodInsert = "insert into table1 values "
+        " (1, '2015', 2), "
+        " (1, '2015-06', 2), "
+        " (1, '2015-06-05', 2), "
+        " (1, '2015-06-05 10', 2), "
+        " (1, '2015-06-05 10:10:11', 2), "
+        " (1, '2015-06-05 10:10:11Z', 2) ",
+    {_DDL, _Mod} = helper_compile_def_to_module(
+        "CREATE TABLE table1 ("
+        "a SINT64 NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "c SINT64 NOT NULL, "
+        "PRIMARY KEY((a, quantum(b, 15, 's')), a, b))"),
+    Lexed = riak_ql_lexer:get_tokens(GoodInsert),
+    {ok, Q} = riak_ql_parser:parse(Lexed),
+    {ok, Insert} = build_sql_record(insert, Q, undefined),
+    Values = Insert#riak_sql_insert_v1.values,
+
+    %% Verify all values are now integers
+    ?assertEqual([],
+                 lists:filtermap(fun(Row) ->
+                                         case lists:filter(fun({integer, _}) -> false;
+                                                              (_) -> true end, Row) of
+                                             [] ->
+                                                 false;
+                                             _ ->
+                                                 true
+                                         end
+                                 end, Values)).
+
+timestamp_parsing_test() ->
+    BadFormat = "20151T10",
+    BadQuery = lists:flatten(
+                 io_lib:format("select * from table1 "
+                               "where b > '~s' and "
+                               " b < '201510T20:00:00'", [BadFormat])),
+    {_DDL, Mod} = helper_compile_def_to_module(
+        "CREATE TABLE table1 ("
+        "a SINT64 NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "c SINT64 NOT NULL, "
+        "PRIMARY KEY((a, quantum(b, 15, 's')), a, b))"),
+    ?assertEqual(timestamp, Mod:get_field_type([<<"b">>])),
+    Lexed = riak_ql_lexer:get_tokens(BadQuery),
+    {ok, Q} = riak_ql_parser:parse(Lexed),
+    ?assertMatch({error, <<"Invalid date/time string">>},
+                 build_sql_record(select, Q, undefined)).
 
 -endif.

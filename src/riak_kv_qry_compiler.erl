@@ -58,18 +58,29 @@
     {ok, [?SQL_SELECT{}]} | {error, any()}.
 compile(?DDL{}, ?SQL_SELECT{is_executable = true}, _MaxSubQueries) ->
     {error, 'query is already compiled'};
-compile(?DDL{} = DDL,
-        ?SQL_SELECT{is_executable = false, 'SELECT' = Sel} = Q, MaxSubQueries) ->
-    if Sel#riak_sel_clause_v1.clause == [] ->
-            {error, 'full table scan not implemented'};
-        el/=se ->
-            case compile_select_clause(DDL, Q) of
-                {ok, S} ->
-                    compile_where_clause(DDL, Q?SQL_SELECT{'SELECT' = S}, MaxSubQueries);
-                {error, _} = Error ->
-                    Error
-            end
+compile(?DDL{ table = T} = DDL,
+        ?SQL_SELECT{is_executable = false} = Q1, MaxSubQueries) ->
+    Mod = riak_ql_ddl:make_module_name(T),
+    case maybe_compile_group_by(Mod, compile_select_clause(DDL, Q1), Q1) of
+        {ok, Q2} ->
+            compile_where_clause(DDL, Q2, MaxSubQueries);
+        {error, _} = Error ->
+            Error
     end.
+
+%%
+maybe_compile_group_by(_, {error,_} = E, _) ->
+    E;
+maybe_compile_group_by(Mod, {ok, Sel3}, ?SQL_SELECT{ group_by = GroupBy } = Q1) ->
+    compile_group_by(Mod, GroupBy, [], Q1?SQL_SELECT{ 'SELECT' = Sel3 }).
+
+%%
+compile_group_by(_, [], Acc, Q) ->
+    {ok, Q?SQL_SELECT{ group_by = lists:reverse(Acc) }};
+compile_group_by(Mod, [{identifier,FieldName}|Tail], Acc, Q)
+        when is_binary(FieldName) ->
+    Pos = Mod:get_field_position([FieldName]),
+    compile_group_by(Mod, Tail, [{Pos,FieldName}|Acc], Q).
 
 %% adding the local key here is a bodge
 %% should be a helper fun in the generated DDL module but I couldn't
@@ -119,8 +130,9 @@ expand_query(?DDL{table = Table, local_key = LK, partition_key = PK},
 
 %% Calulate the final result for an aggregate.
 -spec finalise_aggregate(#riak_sel_clause_v1{}, [any()]) -> [any()].
-finalise_aggregate(#riak_sel_clause_v1{ calc_type = aggregate,
-                                        finalisers = FinaliserFns }, Row) ->
+finalise_aggregate(#riak_sel_clause_v1{ calc_type = CalcType,
+                                        finalisers = FinaliserFns }, Row)
+                    when CalcType == aggregate; CalcType == group_by ->
     finalise_aggregate2(FinaliserFns, Row, Row).
 
 %%
@@ -181,27 +193,33 @@ compile_select_clause(DDL, ?SQL_SELECT{'SELECT' = #riak_sel_clause_v1{ clause = 
     %% whole query
     Acc = {sets:new(), #riak_sel_clause_v1{ }},
     %% iterate from the right so we can append to the head of lists
-    {ResultTypeSet, Q2} = lists:foldl(CompileColFn, Acc, Sel),
+    {ResultTypeSet, Sel1} = lists:foldl(CompileColFn, Acc, Sel),
 
     {ColTypes, Errors} = my_mapfoldl(
         fun(ColASTX, Errors) ->
             infer_col_type(DDL, ColASTX, Errors)
         end, [], Sel),
 
-    case sets:is_element(aggregate, ResultTypeSet) of
-        true  ->
-            Q3 = Q2#riak_sel_clause_v1{
+    IsGroupBy = (Q?SQL_SELECT.group_by /= []),
+    IsAggregate = sets:is_element(aggregate, ResultTypeSet),
+    if
+        IsGroupBy ->
+            Sel2 = Sel1#riak_sel_clause_v1{
+                   calc_type = group_by,
+                   col_names = get_col_names(DDL, Q) };
+        IsAggregate ->
+            Sel2 = Sel1#riak_sel_clause_v1{
                    calc_type = aggregate,
                    col_names = get_col_names(DDL, Q) };
-        false ->
-            Q3 = Q2#riak_sel_clause_v1{
+        not IsAggregate ->
+            Sel2 = Sel1#riak_sel_clause_v1{
                    calc_type = rows,
                    initial_state = [],
                    col_names = get_col_names(DDL, Q) }
     end,
     case Errors of
       [] ->
-          {ok, Q3#riak_sel_clause_v1{
+          {ok, Sel2#riak_sel_clause_v1{
               col_names = get_col_names(DDL, Q),
               col_return_types = lists:flatten(ColTypes) }};
       [_|_] ->
@@ -458,15 +476,15 @@ is_start_key_greater(Mod, LK, StartKey0, EndKey0) ->
 fix_subquery_order(Queries1) ->
     Queries2 = lists:sort(fun fix_subquery_order_compare/2, Queries1),
     case Queries2 of
-        [#riak_select_v1{ 'WHERE' = FirstWhere1 } = FirstQuery|QueryTail] when length(Queries2) > 1 ->
+        [?SQL_SELECT{ 'WHERE' = FirstWhere1 } = FirstQuery|QueryTail] when length(Queries2) > 1 ->
             case lists:keytake(end_inclusive, 1, FirstWhere1) of
                 false ->
                     Queries2;
                 {value, Flag, _FirstWhere2} ->
-                    #riak_select_v1{ 'WHERE' = LastWhere } = LastQuery1 = lists:last(Queries2),
-                    LastQuery2 = LastQuery1#riak_select_v1{ 'WHERE' = lists:keystore(end_inclusive, 1, LastWhere, Flag) },
+                    ?SQL_SELECT{ 'WHERE' = LastWhere } = LastQuery1 = lists:last(Queries2),
+                    LastQuery2 = LastQuery1?SQL_SELECT{ 'WHERE' = lists:keystore(end_inclusive, 1, LastWhere, Flag) },
                     Queries3 = QueryTail -- [LastQuery1],
-                    [FirstQuery#riak_select_v1{ 'WHERE' = FirstWhere1 } | Queries3] ++ [LastQuery2]
+                    [FirstQuery?SQL_SELECT{ 'WHERE' = FirstWhere1 } | Queries3] ++ [LastQuery2]
             end;
         _ ->
             Queries2
@@ -480,10 +498,10 @@ fix_subquery_order(Queries1) ->
 %% Detect this by the implict order of the start/end keys.  Should be
 %% refactored to explicitly understand key order at some future point.
 fix_subquery_order_compare(Qa, Qb) ->
-    {startkey, Astartkey} = lists:keyfind(startkey, 1, Qa#riak_select_v1.'WHERE'),
-    {endkey, Aendkey}     = lists:keyfind(endkey, 1, Qa#riak_select_v1.'WHERE'),
-    {startkey, Bstartkey} = lists:keyfind(startkey, 1, Qb#riak_select_v1.'WHERE'),
-    {endkey, Bendkey}     = lists:keyfind(endkey, 1, Qb#riak_select_v1.'WHERE'),
+    {startkey, Astartkey} = lists:keyfind(startkey, 1, Qa?SQL_SELECT.'WHERE'),
+    {endkey, Aendkey}     = lists:keyfind(endkey, 1, Qa?SQL_SELECT.'WHERE'),
+    {startkey, Bstartkey} = lists:keyfind(startkey, 1, Qb?SQL_SELECT.'WHERE'),
+    {endkey, Bendkey}     = lists:keyfind(endkey, 1, Qb?SQL_SELECT.'WHERE'),
 
     fix_subquery_order_compare(Astartkey, Aendkey, Bstartkey, Bendkey).
 
@@ -583,7 +601,7 @@ find_quantum_field_index_in_key2([], _) ->
     notfound;
 find_quantum_field_index_in_key2([#hash_fn_v1{ mod = riak_ql_quanta,
                                                fn = quantum,
-                                               args = [#param_v1{name = [X]}, Y, Z] }|_], Index) ->
+                                               args = [?SQL_PARAM{name = [X]}, Y, Z] }|_], Index) ->
     {X,Y,Z,Index};
 find_quantum_field_index_in_key2([_|Tail], Index) ->
     find_quantum_field_index_in_key2(Tail, Index+1).
@@ -691,14 +709,14 @@ find_quantum_fields(?DDL{ partition_key = #key_v1{ ast = PKAST } }) ->
 %%
 quantum_fn_to_field_name(#hash_fn_v1{ mod = riak_ql_quanta,
                                       fn = quantum,
-                                      args = [#param_v1{name = [Name]}|_ ] }) ->
+                                      args = [?SQL_PARAM{name = [Name]}|_ ] }) ->
     Name.
 
 check_if_timeseries(?DDL{table = T, partition_key = PK, local_key = LK0} = DDL,
                     [W]) ->
     try
         #key_v1{ast = PartitionKeyAST} = PK,
-        PartitionFields = [X || #param_v1{name = X} <- PartitionKeyAST],
+        PartitionFields = [X || ?SQL_PARAM{name = X} <- PartitionKeyAST],
         LK = LK0#key_v1{ast = lists:sublist(LK0#key_v1.ast, length(PartitionKeyAST))},
         QuantumFieldName = quantum_field_name(DDL),
         StrippedW = strip(W, []),
@@ -913,7 +931,7 @@ rewrite2([], [], _Mod, Acc) ->
 rewrite2([], _W, _Mod, _Acc) ->
     %% the rewrite should have consumed all the passed in values
     {error, {invalid_rewrite, _W}};
-rewrite2([#param_v1{name = [FieldName]} | T], Where1, Mod, Acc) ->
+rewrite2([?SQL_PARAM{name = [FieldName]} | T], Where1, Mod, Acc) ->
     Type = Mod:get_field_type([FieldName]),
     case lists:keytake(FieldName, 2, Where1) of
         false                           ->
@@ -1047,12 +1065,12 @@ get_ddl(SQL) ->
 
 get_standard_pk() ->
     #key_v1{ast = [
-                   #param_v1{name = [<<"location">>]},
-                   #param_v1{name = [<<"user">>]},
+                   ?SQL_PARAM{name = [<<"location">>]},
+                   ?SQL_PARAM{name = [<<"user">>]},
                    #hash_fn_v1{mod = riak_ql_quanta,
                                fn = quantum,
                                args = [
-                                       #param_v1{name = [<<"time">>]},
+                                       ?SQL_PARAM{name = [<<"time">>]},
                                        15,
                                        s
                                       ],
@@ -1062,9 +1080,9 @@ get_standard_pk() ->
 
 get_standard_lk() ->
     #key_v1{ast = [
-                   #param_v1{name = [<<"location">>]},
-                   #param_v1{name = [<<"user">>]},
-                   #param_v1{name = [<<"time">>]}
+                   ?SQL_PARAM{name = [<<"location">>]},
+                   ?SQL_PARAM{name = [<<"user">>]},
+                   ?SQL_PARAM{name = [<<"time">>]}
                   ]}.
 
 %%
@@ -1111,8 +1129,8 @@ simple_rewrite_test() ->
     ?DDL{table = T} = get_standard_ddl(),
     Mod = riak_ql_ddl:make_module_name(T),
     LK  = #key_v1{ast = [
-                         #param_v1{name = [<<"geohash">>]},
-                         #param_v1{name = [<<"time">>]}
+                         ?SQL_PARAM{name = [<<"geohash">>]},
+                         ?SQL_PARAM{name = [<<"time">>]}
                         ]},
     W   = [
            {'=', <<"geohash">>, {word, "yardle"}},
@@ -1135,8 +1153,8 @@ simple_rewrite_fail_1_test() ->
     ?DDL{table = T} = get_standard_ddl(),
     Mod = riak_ql_ddl:make_module_name(T),
     LK  = #key_v1{ast = [
-                         #param_v1{name = [<<"geohash">>]},
-                         #param_v1{name = [<<"user">>]}
+                         ?SQL_PARAM{name = [<<"geohash">>]},
+                         ?SQL_PARAM{name = [<<"user">>]}
                         ]},
     W   = [
            {'=', <<"geohash">>, {"word", "yardle"}}
@@ -1150,8 +1168,8 @@ simple_rewrite_fail_2_test() ->
     ?DDL{table = T} = get_standard_ddl(),
     Mod = riak_ql_ddl:make_module_name(T),
     LK  = #key_v1{ast = [
-                         #param_v1{name = [<<"geohash">>]},
-                         #param_v1{name = [<<"user">>]}
+                         ?SQL_PARAM{name = [<<"geohash">>]},
+                         ?SQL_PARAM{name = [<<"user">>]}
                         ]},
     W   = [
            {'=', <<"user">>, {"word", "yardle"}}
@@ -1165,9 +1183,9 @@ simple_rewrite_fail_3_test() ->
     ?DDL{table = T} = get_standard_ddl(),
     Mod = riak_ql_ddl:make_module_name(T),
     LK  = #key_v1{ast = [
-                         #param_v1{name = [<<"geohash">>]},
-                         #param_v1{name = [<<"user">>]},
-                         #param_v1{name = [<<"temperature">>]}
+                         ?SQL_PARAM{name = [<<"geohash">>]},
+                         ?SQL_PARAM{name = [<<"user">>]},
+                         ?SQL_PARAM{name = [<<"temperature">>]}
                         ]},
     W   = [
            {'=', <<"geohash">>, {"word", "yardle"}}
@@ -1438,20 +1456,18 @@ simple_spanning_boundary_precision_test() ->
     %% now make the result - expecting 2 queries
     [Where1, Where2] =
         test_data_where_clause(<<"Scotland">>, <<"user_1">>, [{3000, 15000}, {15000, 30000}]),
-    _PK = get_standard_pk(),
-    _LK = get_standard_lk(),
     {ok, [Select1, Select2]} = compile(DDL, Q, 5),
     ?assertEqual(
         [Where1, Where2],
-        [Select1#riak_select_v1.'WHERE', Select2#riak_select_v1.'WHERE']
+        [Select1?SQL_SELECT.'WHERE', Select2?SQL_SELECT.'WHERE']
     ),
     ?assertEqual(
         [get_standard_pk(), get_standard_pk()],
-        [Select1#riak_select_v1.partition_key, Select2#riak_select_v1.partition_key]
+        [Select1?SQL_SELECT.partition_key, Select2?SQL_SELECT.partition_key]
     ),
     ?assertEqual(
         [get_standard_lk(), get_standard_lk()],
-        [Select1#riak_select_v1.local_key, Select2#riak_select_v1.local_key]
+        [Select1?SQL_SELECT.local_key, Select2?SQL_SELECT.local_key]
     ).
 
 %%
@@ -2009,7 +2025,7 @@ sum_sum_finalise_test() ->
       ).
 
 extract_stateful_function_1_test() ->
-    {ok, #riak_select_v1{ 'SELECT' = #riak_sel_clause_v1{ clause = [Select] } }} =
+    {ok, ?SQL_SELECT{ 'SELECT' = #riak_sel_clause_v1{ clause = [Select] } }} =
         get_query(
         "SELECT COUNT(col1) + COUNT(col2) FROM mytab "
         "WHERE myfamily = 'familyX' "
@@ -2196,7 +2212,7 @@ flexible_keys_1_test() ->
         [{startkey,[{<<"a1">>,sint64,1}, {<<"a">>,timestamp,1}]},
           {endkey, [{<<"a1">>,sint64,1}, {<<"a">>,timestamp,1000}]},
           {filter,[]}],
-        Select#riak_select_v1.'WHERE'
+        Select?SQL_SELECT.'WHERE'
     ).
 
 %% two element key with quantum
@@ -2208,7 +2224,7 @@ flexible_keys_2_test() ->
     {ok, Q} = get_query(
           "SELECT * FROM tab4 WHERE a > 0 AND a < 1000"),
     ?assertMatch(
-        {ok, [#riak_select_v1{}]},
+        {ok, [?SQL_SELECT{}]},
         compile(DDL, Q, 100)
     ).
 
@@ -2243,7 +2259,7 @@ no_quantum_in_query_1_test() ->
         "PRIMARY KEY  ((a,b), a,b))"),
     {ok, Q} = get_query(
           "SELECT * FROM tab1 WHERE a = 1 AND b = 1"),
-    {ok, [#riak_select_v1{ 'WHERE' = Where }]} = compile(DDL, Q, 100),
+    {ok, [?SQL_SELECT{ 'WHERE' = Where }]} = compile(DDL, Q, 100),
     ?assertEqual(
                 [{startkey,[{<<"a">>,timestamp,1},{<<"b">>,varchar,1}]},
                  {endkey,  [{<<"a">>,timestamp,1},{<<"b">>,varchar,1}]},
@@ -2271,7 +2287,7 @@ no_quantum_in_query_2_test() ->
          {endkey, Key},
          {filter,[]},
          {end_inclusive,true}],
-        Select#riak_select_v1.'WHERE'
+        Select?SQL_SELECT.'WHERE'
     ).
 
 
@@ -2293,7 +2309,7 @@ no_quantum_in_query_3_test() ->
          {endkey, Key},
          {filter,{'=',{field,<<"d">>,boolean},{const, true}}},
          {end_inclusive,true}],
-        Select#riak_select_v1.'WHERE'
+        Select?SQL_SELECT.'WHERE'
     ).
 
 %% one element key
@@ -2310,7 +2326,7 @@ no_quantum_in_query_4_test() ->
           {endkey,[{<<"a">>,timestamp,1000}]},
           {filter,[]},
           {end_inclusive,true}],
-        Select#riak_select_v1.'WHERE'
+        Select?SQL_SELECT.'WHERE'
     ).
 
 two_element_key_range_cannot_match_test() ->
@@ -2324,6 +2340,50 @@ two_element_key_range_cannot_match_test() ->
     ?assertMatch(
         {error, {lower_and_upper_bounds_are_equal_when_no_equals_operator, <<_/binary>>}},
         compile(DDL, Q, 100)
+    ).
+
+group_by_one_field_test() ->
+    DDL = get_ddl(
+        "CREATE TABLE mytab("
+        "a TIMESTAMP NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "PRIMARY KEY  ((a,b), a,b))"),
+    {ok, Q1} = get_query(
+        "SELECT b FROM tab1 "
+        "WHERE a = 1 AND b = 2 GROUP BY b"),
+    {ok, [Q2]} = compile(DDL, Q1, 100),
+    ?assertEqual(
+        [{2,<<"b">>}],
+        Q2?SQL_SELECT.group_by
+    ).
+
+group_by_two_fields_test() ->
+    DDL = get_ddl(
+        "CREATE TABLE mytab("
+        "a TIMESTAMP NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "PRIMARY KEY  ((a,b), a,b))"),
+    {ok, Q1} = get_query(
+        "SELECT b FROM tab1 "
+        "WHERE a = 1 AND b = 2 GROUP BY b, a"),
+    {ok, [Q2]} = compile(DDL, Q1, 100),
+    ?assertEqual(
+        [{2,<<"b">>},{1,<<"a">>}],
+        Q2?SQL_SELECT.group_by
+    ).
+
+group_by_column_not_in_the_table_test() ->
+    DDL = get_ddl(
+        "CREATE TABLE mytab("
+        "a TIMESTAMP NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "PRIMARY KEY  ((a,b), a,b))"),
+    {ok, Q1} = get_query(
+        "SELECT x FROM tab1 "
+        "WHERE a = 1 AND b = 2 GROUP BY x"),
+    ?assertError(
+        {unknown_column,{<<"x">>,[<<"a">>,<<"b">>]}},
+        compile(DDL, Q1, 100)
     ).
 
 negate_an_aggregation_function_test() ->
@@ -2348,7 +2408,7 @@ negate_an_aggregation_function_test() ->
 %           "SELECT * FROM table1 "
 %           "WHERE a = 1 AND b = 1 AND c >= 4000 AND c <= 5000"),
 %     {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
-%     SubQueryWheres = [S#riak_select_v1.'WHERE' || S <- SubQueries],
+%     SubQueryWheres = [S?SQL_SELECT.'WHERE' || S <- SubQueries],
 %     ?assertEqual(
 %         [
 %             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5000}]},
@@ -2385,7 +2445,7 @@ negate_an_aggregation_function_test() ->
 %              {start_inclusive,false},
 %              {end_inclusive,true}]
 %         ],
-%         [S#riak_select_v1.'WHERE' || S <- fix_subquery_order(SubQueries)]
+%         [S?SQL_SELECT.'WHERE' || S <- fix_subquery_order(SubQueries)]
 %     ).
 
 % query_desc_order_on_quantum_at_quantum_across_quanta_test() ->
@@ -2393,7 +2453,7 @@ negate_an_aggregation_function_test() ->
 %           "SELECT * FROM table1 "
 %           "WHERE a = 1 AND b = 1 AND c >= 3500 AND c <= 5500"),
 %     {ok, SubQueries} = compile(helper_desc_order_on_quantum_ddl(), Q, 100),
-%     SubQueryWheres = [S#riak_select_v1.'WHERE' || S <- SubQueries],
+%     SubQueryWheres = [S?SQL_SELECT.'WHERE' || S <- SubQueries],
 %     ?assertEqual(
 %         [
 %             [{startkey,[{<<"a">>,sint64,1},{<<"b">>,sint64,1},{<<"c">>,timestamp,5500}]},

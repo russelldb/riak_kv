@@ -35,12 +35,13 @@
 
 %% enumerate all current SQL query types
 -type query_type() ::
-        ddl | select | describe | insert.
+        ddl | explain | describe | insert | select | show_tables.
 %% and also their corresponding records (mainly for use in specs)
 -type sql_query_type_record() ::
         ?SQL_SELECT{} |
         #riak_sql_describe_v1{} |
-        #riak_sql_insert_v1{}.
+        #riak_sql_insert_v1{} |
+        #riak_sql_show_tables_v1{}.
 
 -type query_tabular_result() :: {[riak_pb_ts_codec:tscolumnname()],
                                  [riak_pb_ts_codec:tscolumntype()],
@@ -73,8 +74,11 @@ submit(#riak_sql_describe_v1{}, DDL) ->
 submit(SQL = #riak_sql_insert_v1{}, _DDL) ->
     do_insert(SQL);
 submit(SQL = ?SQL_SELECT{}, DDL) ->
-    do_select(SQL, DDL).
-
+    do_select(SQL, DDL);
+submit(#riak_sql_show_tables_v1{} = _SQL, _DDL) ->
+    do_show_tables();
+submit(#riak_sql_explain_query_v1{'EXPLAIN' = Select}, DDL) ->
+    do_explain_query(DDL, Select).
 
 %% ---------------------
 %% local functions
@@ -228,25 +232,25 @@ describe_field_order(Name, _LKSpec) when is_binary(Name) ->
 %% the following two functions are identical, for the way fields and
 %% keys are represented as of 2015-12-18; duplication here is a hint
 %% of things to come.
--spec column_pk_position_or_blank(binary(), [#param_v1{}]) -> integer() | [].
+-spec column_pk_position_or_blank(binary(), [?SQL_PARAM{}]) -> integer() | [].
 column_pk_position_or_blank(Col, KSpec) ->
     count_to_position(Col, KSpec, 1).
 
--spec column_lk_position_or_blank(binary(), [#param_v1{}]) -> integer() | [].
+-spec column_lk_position_or_blank(binary(), [?SQL_PARAM{}]) -> integer() | [].
 column_lk_position_or_blank(Col, KSpec) ->
     count_to_position(Col, KSpec, 1).
 
 %% Extract the quantum column information, if it exists in the table definition
 %% and put in two additional columns
--spec columns_quantum_or_blank(Col :: binary(), PKSpec :: [#param_v1{}|#hash_fn_v1{}]) ->
+-spec columns_quantum_or_blank(Col :: binary(), PKSpec :: [?SQL_PARAM{}|#hash_fn_v1{}]) ->
       [binary() | []].
-columns_quantum_or_blank(Col, #hash_fn_v1{args = [#param_v1{name = [Col]}, Interval, Unit]}) ->
+columns_quantum_or_blank(Col, #hash_fn_v1{args = [?SQL_PARAM{name = [Col]}, Interval, Unit]}) ->
     [Interval, list_to_binary(io_lib:format("~p", [Unit]))];
 columns_quantum_or_blank(_Col, _PKSpec) ->
     [[], []].
 
 %% Find the field associated with the quantum, if there is one
--spec find_quantum_field([#param_v1{}|#hash_fn_v1{}]) -> [] | #hash_fn_v1{}.
+-spec find_quantum_field([?SQL_PARAM{}|#hash_fn_v1{}]) -> [] | #hash_fn_v1{}.
 find_quantum_field([]) ->
     [];
 find_quantum_field([Q = #hash_fn_v1{}|_]) ->
@@ -256,9 +260,9 @@ find_quantum_field([_|T]) ->
 
 count_to_position(_, [], _) ->
     [];
-count_to_position(Col, [#param_v1{name = [Col]} | _], Pos) ->
+count_to_position(Col, [?SQL_PARAM{name = [Col]} | _], Pos) ->
     Pos;
-count_to_position(Col, [#hash_fn_v1{args = [#param_v1{name = [Col]} | _]} | _], Pos) ->
+count_to_position(Col, [#hash_fn_v1{args = [?SQL_PARAM{name = [Col]} | _]} | _], Pos) ->
     Pos;
 count_to_position(Col, [_ | Rest], Pos) ->
     count_to_position(Col, Rest, Pos + 1).
@@ -314,6 +318,49 @@ format_query_syntax_errors(Errors) ->
 empty_result() ->
     {[], [], []}.
 
+%%
+%% SHOW TABLES statement
+%%
+-spec do_show_tables() -> {ok, query_tabular_result()} | {error, term()}.
+do_show_tables() ->
+    Tables = riak_kv_compile_tab:get_all_table_names(),
+    build_show_tables_result(Tables).
+
+-spec build_show_tables_result([binary()]) -> tuple().
+build_show_tables_result(Tables) ->
+    ColumnNames = [<<"Table">>],
+    ColumnTypes = [varchar],
+    Rows = [[T] || T <- Tables],
+    {ok, {ColumnNames, ColumnTypes, Rows}}.
+
+%%
+%% EXPLAIN statement
+%%
+-spec do_explain_query(DDL :: ?DDL{},
+                       Select :: ?SQL_SELECT{}) ->
+                       {ok, query_tabular_result()} | {error, term()}.
+do_explain_query(DDL, Select) ->
+    ColumnNames = [
+        <<"Subquery">>,
+        <<"Range Scan Start Key">>,
+        <<"Is Start Inclusive?">>,
+        <<"Range Scan End Key">>,
+        <<"Is End Inclusive?">>,
+        <<"Filter">>],
+    ColumnTypes = [
+        integer,
+        varchar,
+        boolean,
+        varchar,
+        boolean,
+        varchar],
+    case riak_kv_ts_util:explain_query(DDL, Select) of
+        {error, Error} ->
+            {error, Error};
+        Rows ->
+            {ok, {ColumnNames, ColumnTypes, Rows}}
+    end.
+
 %%%===================================================================
 %%% Unit tests
 %%%===================================================================
@@ -363,6 +410,42 @@ describe_table_columns_no_quantum_test() ->
              [<<"w">>, <<"sint64">>,    false, [], [], <<"ASC">>, [], []],
              [<<"p">>, <<"double">>,    true,  [], [], <<"ASC">>, [], []]]}},
         Res).
+
+show_tables_test() ->
+    Res = build_show_tables_result([<<"fafa">>,<<"lala">>]),
+    ?assertMatch(
+        {ok, {[<<"Table">>], [varchar], [[<<"fafa">>], [<<"lala">>]]}},
+        Res).
+
+explain_query_test() ->
+    {ddl, DDL, []} =
+        riak_ql_parser:ql_parse(
+            riak_ql_lexer:get_tokens(
+                "CREATE TABLE tab ("
+                "a SINT64 NOT NULL,"
+                "b TIMESTAMP NOT NULL,"
+                "c VARCHAR NOT NULL,"
+                "d SINT64,"
+                "e BOOLEAN,"
+                "f VARCHAR,"
+                "PRIMARY KEY  ((c, QUANTUM(b, 1, 's')), c,b,a))")),
+    riak_ql_ddl_compiler:compile_and_load_from_tmp(DDL),
+    SQL = "SELECT a,b,c FROM tab WHERE b > 0 AND b < 2000 AND a=319 AND c='hola' AND (d=15 OR (e=true AND f='adios'))",
+    {ok, Q} = riak_ql_parser:parse(riak_ql_lexer:get_tokens(SQL)),
+    {ok, Select} = riak_kv_ts_util:build_sql_record(select, Q, undefined),
+    Res = do_explain_query(DDL, Select),
+    ExpectedRows =
+        [[1,"c = 'hola', b = 1",false,"c = 'hola', b = 1000",false,
+            "(((d = 15) OR ((e = true) AND (f = 'adios'))) AND (a = 319))"],
+         [2,"c = 'hola', b = 1000",false,"c = 'hola', b = 2000",false,
+            "(((d = 15) OR ((e = true) AND (f = 'adios'))) AND (a = 319))"]],
+    ?assertMatch(
+        {ok, {_, _, ExpectedRows}},
+        Res),
+    Res1 = submit("EXPLAIN " ++ SQL, DDL),
+    ?assertMatch(
+        {ok, {_, _, ExpectedRows}},
+        Res1).
 
 validate_make_insert_row_basic_test() ->
     Data = [{integer,4}, {binary,<<"bamboozle">>}, {float, 3.14}],

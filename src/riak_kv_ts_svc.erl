@@ -86,7 +86,8 @@ decode_query_common(Q, Cover) ->
     end.
 
 -spec decode_query(Query::#tsinterpolation{}, Cover::term()) ->
-    {error, _} | {ok, ts_query_types()}.
+    {error, _} | {ddl, {ok, {?DDL{}, proplists:proplist()}}}
+               | {ts_query_types(), riak_kv_qry:sql_query_type_record()}.
 decode_query(#tsinterpolation{}, Cover)
   when not (Cover == undefined orelse is_binary(Cover)) ->
     {error, bad_coverage_context};
@@ -138,8 +139,8 @@ process(M = #tscoveragereq{table = Table}, State) ->
 
 %% The following heads of `process' are all, in terms of protobuffer
 %% structures, a `#tsqueryreq{}', subdivided per query type (CREATE
-%% TABLE, SELECT, DESCRIBE, INSERT). The first argument will be the
-%% specific SQL converted from the original `#tsqueryreq{}' in
+%% TABLE, SELECT, DESCRIBE, INSERT, SHOW TABLES). The first argument will
+%% be the specific SQL converted from the original `#tsqueryreq{}' in
 %% `riak_kv_pb_ts:decode' via `decode_query_common').
 process({DDL = ?DDL{}, WithProperties}, State) ->
     %% the only one that doesn't require an activated table
@@ -152,6 +153,15 @@ process(M = #riak_sql_describe_v1{'DESCRIBE' = Table}, State) ->
     check_table_and_call(Table, fun sub_tsqueryreq/4, M, State);
 
 process(M = #riak_sql_insert_v1{'INSERT' = Table}, State) ->
+    check_table_and_call(Table, fun sub_tsqueryreq/4, M, State);
+
+process(#riak_sql_show_tables_v1{}, State) ->
+    {ok, {ColNames, ColTypes, LdbNativeRows}} =
+        riak_kv_qry:submit(#riak_sql_show_tables_v1{}, ?DDL{}),
+    Rows = [list_to_tuple(R) || R <- LdbNativeRows],
+    {reply, make_tsqueryresp({ColNames, ColTypes, Rows}), State};
+
+process(M = #riak_sql_explain_query_v1{'EXPLAIN' = ?SQL_SELECT{'FROM' = Table}}, State) ->
     check_table_and_call(Table, fun sub_tsqueryreq/4, M, State).
 
 %% There is no two-tuple variants of process_stream for tslistkeysresp
@@ -386,7 +396,7 @@ sub_tslistkeysreq(Mod, DDL, #tslistkeysreq{table = Table,
         {ok, ReqId} ->
             ColumnInfo =
                 [Mod:get_field_type(N)
-                 || #param_v1{name = N} <- DDL?DDL.local_key#key_v1.ast],
+                 || ?SQL_PARAM{name = N} <- DDL?DDL.local_key#key_v1.ast],
             EncodeStreamKeysFn =
                 fun(CompoundKeys) ->
                     encode_rows_for_streaming(Mod, ColumnInfo, CompoundKeys)
@@ -493,7 +503,7 @@ sub_tsqueryreq(_Mod, DDL = ?DDL{table = Table}, SQL, State) ->
 %% Check that Table is good wrt TS operations and call a specified
 %% function with its Mod and DDL; generate an appropriate
 %% #rpberrorresp{} if a corresponding bucket type has not been
-%% actvated or Table has no DDL (not a TS bucket). Otherwise,
+%% activated or Table has no DDL (not a TS bucket). Otherwise,
 %% transparently call the WorkItem function.
 check_table_and_call(Table, Fun, TsMessage, State) ->
     case riak_kv_ts_util:get_table_ddl(Table) of
