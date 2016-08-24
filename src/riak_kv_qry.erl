@@ -78,7 +78,7 @@ submit(SQL = ?SQL_SELECT{}, DDL) ->
 submit(#riak_sql_show_tables_v1{} = _SQL, _DDL) ->
     do_show_tables();
 submit(#riak_sql_explain_query_v1{'EXPLAIN' = Select}, DDL) ->
-    do_explain_query(DDL, Select).
+    do_explain(DDL, Select).
 
 %% ---------------------
 %% local functions
@@ -94,11 +94,15 @@ do_insert(#riak_sql_insert_v1{'INSERT' = Table,
     case lookup_field_positions(Mod, Fields) of
         {ok, Positions} ->
             Empty = make_empty_row(Mod),
-            case xlate_insert_to_putdata(Values, Positions, Empty) of
-                {error, Reason} ->
-                    {error, Reason};
+            Types = [catch Mod:get_field_type([Column]) || {identifier, [Column]} <- Fields],
+            try xlate_insert_to_putdata(Values, Positions, Empty, Types) of
                 {ok, Data} ->
-                    insert_putreqs(Mod, Table, Data)
+                    insert_putreqs(Mod, Table, Data);
+                {error, Reason} ->
+                    {error, Reason}
+            catch
+                throw:Reason ->
+                    {error, Reason}
             end;
         {error, Reason} ->
             {error, Reason}
@@ -160,11 +164,17 @@ lookup_field_positions(Mod, FieldIdentifiers) ->
 %% and the general validation rules should pick that up.
 %% If there are too many values given for the fields it returns an error.
 %%
--spec xlate_insert_to_putdata([[riak_ql_ddl:data_value()]], [pos_integer()], tuple(undefined)) ->
+%% Additionally, we will convert Value in {varchar, Value} into an
+%% integer when that value is a timestamp. We would do it as we
+%% repackage list to tuple here, rather than separately as a
+%% post-processing step on Data, to avoid another round of
+%% list_to_tuple(tuple_to_list())
+-spec xlate_insert_to_putdata([[riak_ql_ddl:data_value()]], [pos_integer()], tuple(undefined),
+                              [riak_ql_ddl:simple_field_type()]) ->
                               {ok, [tuple()]} | {error, string()}.
-xlate_insert_to_putdata(Values, Positions, Empty) ->
+xlate_insert_to_putdata(Values, Positions, Empty, FieldTypes) ->
     ConvFn = fun(RowVals, {Good, Bad, RowNum}) ->
-                 case make_insert_row(RowVals, Positions, Empty) of
+                 case make_insert_row(RowVals, Positions, Empty, FieldTypes) of
                      {ok, Row} ->
                          {[Row | Good], Bad, RowNum + 1};
                      {error, _Reason} ->
@@ -179,18 +189,29 @@ xlate_insert_to_putdata(Values, Positions, Empty) ->
             {error, {too_many_insert_values, lists:reverse(Errors)}}
     end.
 
--spec make_insert_row([] | [riak_ql_ddl:data_value()], [] | [pos_integer()], tuple()) ->
+-spec make_insert_row([riak_ql_ddl:data_value()], [pos_integer()], tuple(),
+                      [riak_ql_ddl:simple_field_type()]) ->
                       {ok, tuple()} | {error, string()}.
-make_insert_row([], _Positions, Row) when is_tuple(Row) ->
+make_insert_row(Vals, _Positions, Row, _FieldTypes)
+  when length(Vals) > size(Row) ->
+    %% diagnose too_many_values before eventual timestamp conversion
+    %% errors, so that it is reported with higher precedence than that
+    {error, too_many_values};
+make_insert_row([], _Positions, Row, _FieldTypes) ->
     %% Out of entries in the value - row is populated with default values
     %% so if we run out of data for implicit/explicit fieldnames can just return
     {ok, Row};
-make_insert_row(_, [], Row) when is_tuple(Row) ->
-    %% Too many values for the field
-    {error, too_many_values};
-%% Make sure the types match
-make_insert_row([{_Type, Val} | Values], [Pos | Positions], Row) when is_tuple(Row) ->
-    make_insert_row(Values, Positions, setelement(Pos, Row, Val)).
+make_insert_row([TypedVal | Values], [Pos | Positions], Row, FieldTypes) ->
+    %% Note the Type in TypedVal = {Type, _} is what the value was
+    %% parsed into, while its counterpart in FieldTypes is what DDL
+    %% expects it to be
+    Val = maybe_convert_timestamp(TypedVal, lists:nth(Pos, FieldTypes)),
+    make_insert_row(Values, Positions, setelement(Pos, Row, Val), FieldTypes).
+
+maybe_convert_timestamp({binary, String}, timestamp) ->
+    riak_kv_ts_util:varchar_to_timestamp(String);
+maybe_convert_timestamp({_NonTSType, Val}, _OtherType) ->
+    Val.
 
 
 %% DESCRIBE
@@ -336,12 +357,13 @@ build_show_tables_result(Tables) ->
 %%
 %% EXPLAIN statement
 %%
--spec do_explain_query(DDL :: ?DDL{},
-                       Select :: ?SQL_SELECT{}) ->
-                       {ok, query_tabular_result()} | {error, term()}.
-do_explain_query(DDL, Select) ->
+-spec do_explain(DDL :: ?DDL{},
+                 Select :: ?SQL_SELECT{}) ->
+                        {ok, query_tabular_result()} | {error, term()}.
+do_explain(DDL, Select) ->
     ColumnNames = [
         <<"Subquery">>,
+        <<"Coverage Plan">>,
         <<"Range Scan Start Key">>,
         <<"Is Start Inclusive?">>,
         <<"Range Scan End Key">>,
@@ -349,6 +371,7 @@ do_explain_query(DDL, Select) ->
         <<"Filter">>],
     ColumnTypes = [
         integer,
+        varchar,
         varchar,
         boolean,
         varchar,
@@ -433,11 +456,36 @@ explain_query_test() ->
     SQL = "SELECT a,b,c FROM tab WHERE b > 0 AND b < 2000 AND a=319 AND c='hola' AND (d=15 OR (e=true AND f='adios'))",
     {ok, Q} = riak_ql_parser:parse(riak_ql_lexer:get_tokens(SQL)),
     {ok, Select} = riak_kv_ts_util:build_sql_record(select, Q, undefined),
-    Res = do_explain_query(DDL, Select),
+    meck:new(riak_client),
+    meck:new(riak_core_apl),
+    meck:new(riak_core_bucket),
+    meck:new(riak_core_claimant),
+    meck:expect(riak_client, ring_size, fun() -> 8 end),
+    meck:expect(riak_core_claimant, get_bucket_type, fun(_, _) -> [{n_val, 3}] end),
+    meck:expect(riak_core_bucket, get_bucket, fun(_) -> [{chash_keyfun,{riak_core_util,chash_std_keyfun}}] end),
+    meck:expect(riak_core_apl, get_primary_apl,
+        fun(_, 3, riak_kv) ->
+            [{{35195593916248939066258330623111144003363405826,
+                'dev1@127.0.0.1'},
+                primary},
+             {{274031556999544297163190906134303066185487351809,
+                'dev1@127.0.0.1'},
+                primary},
+             {{296867520082839655260123481645494988367611297792,
+                'dev1@127.0.0.1'},
+                primary}]
+        end),
+    ?assert(meck:validate(riak_client)),
+    ?assert(meck:validate(riak_core_apl)),
+    ?assert(meck:validate(riak_core_bucket)),
+    ?assert(meck:validate(riak_core_claimant)),
+    Res = do_explain(DDL, Select),
     ExpectedRows =
-        [[1,"c = 'hola', b = 1",false,"c = 'hola', b = 1000",false,
+        [[1,"dev1@127.0.0.1/0, dev1@127.0.0.1/1, dev1@127.0.0.1/1",
+            "c = 'hola', b = 1",false,"c = 'hola', b = 1000",false,
             "(((d = 15) OR ((e = true) AND (f = 'adios'))) AND (a = 319))"],
-         [2,"c = 'hola', b = 1000",false,"c = 'hola', b = 2000",false,
+        [2,"dev1@127.0.0.1/0, dev1@127.0.0.1/1, dev1@127.0.0.1/1",
+            "c = 'hola', b = 1000",false,"c = 'hola', b = 2000",false,
             "(((d = 15) OR ((e = true) AND (f = 'adios'))) AND (a = 319))"]],
     ?assertMatch(
         {ok, {_, _, ExpectedRows}},
@@ -445,13 +493,17 @@ explain_query_test() ->
     Res1 = submit("EXPLAIN " ++ SQL, DDL),
     ?assertMatch(
         {ok, {_, _, ExpectedRows}},
-        Res1).
+        Res1),
+    meck:unload(riak_client),
+    meck:unload(riak_core_apl),
+    meck:unload(riak_core_bucket),
+    meck:unload(riak_core_claimant).
 
 validate_make_insert_row_basic_test() ->
     Data = [{integer,4}, {binary,<<"bamboozle">>}, {float, 3.14}],
     Positions = [3, 1, 2],
     Row = {undefined, undefined, undefined},
-    Result = make_insert_row(Data, Positions, Row),
+    Result = make_insert_row(Data, Positions, Row, [varchar, double, sint64]),
     ?assertEqual(
         {ok, {<<"bamboozle">>, 3.14, 4}},
         Result
@@ -461,7 +513,7 @@ validate_make_insert_row_too_many_test() ->
     Data = [{integer,4}, {binary,<<"bamboozle">>}, {float, 3.14}, {integer, 8}],
     Positions = [3, 1, 2],
     Row = {undefined, undefined, undefined},
-    Result = make_insert_row(Data, Positions, Row),
+    Result = make_insert_row(Data, Positions, Row, [varchar, double, sint64]),
     ?assertEqual(
         {error, too_many_values},
         Result
@@ -473,19 +525,56 @@ validate_xlate_insert_to_putdata_ok_test() ->
     Values = [[{integer, 4}, {binary, <<"babs">>}, {float, 5.67}, {binary, <<"bingo">>}],
               [{integer, 8}, {binary, <<"scat">>}, {float, 7.65}, {binary, <<"yolo!">>}]],
     Positions = [5, 3, 1, 2, 4],
-    Result = xlate_insert_to_putdata(Values, Positions, Empty),
+    Result = xlate_insert_to_putdata(Values, Positions, Empty, [double, varchar, varchar, binary, sint64]),
     ?assertEqual(
         {ok,[{5.67,<<"bingo">>,<<"babs">>,undefined,4},
              {7.65,<<"yolo!">>,<<"scat">>,undefined,8}]},
         Result
     ).
 
+good_timestamp_insert_test() ->
+    GoodInsert = "insert into table1 values "
+        " (1, '2015', 2), "
+        " (1, '2015-06', 2), "
+        " (1, '2015-06-05', 2), "
+        " (1, '2015-06-05 10', 2), "
+        " (1, '2015-06-05 10:10:11', 2), "
+        " (1, '2015-06-05 10:10:11Z', 2) ",
+    {_DDL, _Mod} = helper_compile_def_to_module(
+        "CREATE TABLE table1 ("
+        "a SINT64 NOT NULL, "
+        "b TIMESTAMP NOT NULL, "
+        "c SINT64 NOT NULL, "
+        "PRIMARY KEY((a, quantum(b, 15, 's')), a, b))"),
+    Lexed = riak_ql_lexer:get_tokens(GoodInsert),
+    {ok, Q} = riak_ql_parser:parse(Lexed),
+    {ok, Insert} = riak_kv_ts_util:build_sql_record(insert, Q, undefined),
+    Res = xlate_insert_to_putdata(
+            Insert#riak_sql_insert_v1.values,
+            [1,2,3], {undefined, undefined, undefined},
+            [sint64, timestamp, sint64]),
+
+    ?assertEqual({ok, [{1,1420070400000,2},
+                       {1,1433116800000,2},
+                       {1,1433462400000,2},
+                       {1,1433498400000,2},
+                       {1,1433499011000,2},
+                       {1,1433499011000,2}]},
+                Res).
+
+helper_compile_def_to_module(SQL) ->
+    Lexed = riak_ql_lexer:get_tokens(SQL),
+    {ok, {DDL, _Props}} = riak_ql_parser:parse(Lexed),
+    {module, Mod} = riak_ql_ddl_compiler:compile_and_load_from_tmp(DDL),
+    {DDL, Mod}.
+
+
 validate_xlate_insert_to_putdata_too_many_values_test() ->
-    Empty = list_to_tuple(lists:duplicate(5, undefined)),
+    Empty = list_to_tuple(lists:duplicate(4, undefined)),
     Values = [[{integer, 4}, {binary, <<"babs">>}, {float, 5.67}, {binary, <<"bingo">>}, {integer, 7}],
-           [{integer, 8}, {binary, <<"scat">>}, {float, 7.65}, {binary, <<"yolo!">>}]],
+              [{integer, 8}, {binary, <<"scat">>}, {float, 7.65}, {binary, <<"yolo!">>}]],
     Positions = [3, 1, 2, 4],
-    Result = xlate_insert_to_putdata(Values, Positions, Empty),
+    Result = xlate_insert_to_putdata(Values, Positions, Empty, [double, varchar, varchar, binary]),
     ?assertEqual(
         {error,{too_many_insert_values, [1]}},
         Result
