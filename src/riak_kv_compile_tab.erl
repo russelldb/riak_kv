@@ -41,15 +41,6 @@
 %% the table for TS 1.5
 -define(TABLE3, riak_kv_compile_tab_v3).
 
--type compile_state() :: compiling | compiled | failed | retrying.
--export_type([compile_state/0]).
-
--define(is_compile_state(S),
-        (S == compiling orelse
-         S == compiled orelse
-         S == failed orelse
-         S == retrying)).
-
 %% previous versions of the compile table used a plain tuple, and it was
 %% difficult to different versions of the row tuple in the table for fear
 %% of mixing them up. A versioned row record means several versions can
@@ -61,9 +52,7 @@
     table = '_' :: binary(),
     %% dets key, a composite of the table name and ddl version
     table_version = '_' :: {binary(), riak_ql_ddl:ddl_version()},
-    ddl = '_' :: riak_ql_ddl:any_ddl(),
-    compiler_pid = '_' :: pid(),
-    compile_state = '_' :: compile_state()
+    ddl = '_' :: riak_ql_ddl:any_ddl()
  }).
 
 %%
@@ -90,11 +79,8 @@ file_v3(Dir) ->
     filename:join(Dir, [?TABLE3, ".dets"]).
 
 %%
--spec insert(BucketType :: binary(),
-             DDL :: term(),
-             CompilerPid :: pid(),
-             State :: compile_state()) -> ok | error.
-insert(BucketType, DDL, CompilerPid, State) when is_binary(BucketType),
+-spec insert(BucketType :: binary(), DDL :: term()) -> ok.
+insert(BucketType, DDL) when is_binary(BucketType),
                                                  is_tuple(DDL) ->
     lager:info("DDL DETS Update: ~p, ~p, ~p, ~p",
                [BucketType, DDL, CompilerPid, State]),
@@ -110,10 +96,13 @@ insert(BucketType, DDL, CompilerPid, State) when is_binary(BucketType),
     ok = insert_v2(BucketType, DDL, CompilerPid, State).
 
 %% insert into the v2 table so that the record is available
-insert_v2(BucketType, #ddl_v1{} = DDL, CompilerPid, State) ->
+insert_v2(BucketType, #ddl_v1{} = DDL) ->
     %% the version is always 1 for the v2 table
     DDLVersion = 1,
-    V2Row = {BucketType, DDLVersion, DDL, CompilerPid, State},
+    %% put compiling as the compile state in the old table so that
+    %% it will always recompile the modules on a downgrade
+    CompileState = compiling,
+    V2Row = {BucketType, DDLVersion, DDL, self(), CompileState},
     dets:insert(?TABLE2, V2Row),
     ok = dets:sync(?TABLE2);
 insert_v2(BucketType, DDL, CompilerPid, State) ->
@@ -123,29 +112,7 @@ insert_v2(BucketType, DDL, CompilerPid, State) ->
             %% cluster containing a 1.4 node
             ok;
         DDLV1 ->
-            insert_v2(BucketType, DDLV1, CompilerPid, State)
-    end.
-
-%% Check if the bucket type is in the compiling state.
--spec is_compiling(BucketType::binary(), Version::riak_ql:ddl_version()) ->
-    {true, pid()} | false.
-is_compiling(BucketType, Version) when is_binary(BucketType), is_atom(Version) ->
-    case dets:lookup(?TABLE3, {BucketType,Version}) of
-        [#row_v3{ compile_state = compiling, compiler_pid = Pid }] ->
-            {true, Pid};
-        _ ->
-            false
-    end.
-
-%%
--spec get_state(BucketType :: binary(), Version::riak_ql:ddl_version()) ->
-        compile_state() | notfound.
-get_state(BucketType, Version) when is_binary(BucketType), is_atom(Version) ->
-    case dets:lookup(?TABLE3, {BucketType,Version}) of
-        [#row_v3{ compile_state = State }] ->
-            State;
-        [] ->
-            notfound
+            insert_v2(BucketType, DDLV1)
     end.
 
 %%
@@ -168,11 +135,11 @@ get_compiled_ddl_versions(BucketType) when is_binary(BucketType) ->
 
 %%
 -spec get_ddl(BucketType::binary(), Version::riak_ql_ddl:ddl_version()) ->
-        term() | notfound.
+        {ok, term()} | notfound.
 get_ddl(BucketType, Version) when is_binary(BucketType), is_atom(Version) ->
     case dets:lookup(?TABLE3, {BucketType,Version}) of
         [#row_v3{ ddl = DDL }] ->
-            DDL;
+            {ok, DDL};
         [] ->
             notfound
     end.
@@ -184,48 +151,6 @@ get_all_table_names() ->
                                            compile_state = compiled }),
     Tables = [Table || [Table] <- Matches],
     lists:usort(Tables).
--include_lib("eunit/include/eunit.hrl").
-
-%% Update the compilation state using the compiler pid as a key.
-%% Since it has an active Pid, it is assumed to have a DDL version already.
--spec update_state(CompilerPid :: pid(), State :: compile_state()) ->
-        ok | error | notfound.
-update_state(CompilerPid, State) when is_pid(CompilerPid),
-                                      ?is_compile_state(State) ->
-    MatchRow = #row_v3{
-        table = '$1',
-        ddl = '$2',
-        compiler_pid = CompilerPid },
-
-    ?debugFmt("UPDATE STATE ~p", [MatchRow]),
-    dets:traverse(?TABLE3, fun(X) -> ?debugFmt("~p", [X]) end),
-
-    case dets:match(?TABLE3, MatchRow) of
-        [[BucketType, DDL]] ->
-            insert(BucketType, DDL, CompilerPid, State);
-        [] ->
-            notfound
-    end.
-
-% %% Mark any lingering compilations as being retried
--spec mark_compiling_for_retry() -> ok.
-mark_compiling_for_retry() ->
-    CompilingPids = dets:match(?TABLE3, {'_','_','_','$1',compiling}),
-    lists:foreach(
-        fun([Pid]) ->
-            update_state(Pid, retrying)
-        end, CompilingPids).
-
-%% Get the list of records which need to be recompiled
--spec get_ddl_records_needing_recompiling(DDLVersion :: riak_ql_component:component_version()) ->
-    [binary()].
-get_ddl_records_needing_recompiling(DDLVersion) ->
-    %% First find all tables with a version
-    MismatchedTables = dets:select(?TABLE3, [{{'$1','$2','_','_',compiled},[{'/=','$2', DDLVersion}],['$$']}]),
-    RetryingTables = dets:match(?TABLE3, {'$1','$2','_','_',retrying}),
-    Tables = [hd(X) || X <- MismatchedTables ++ RetryingTables],
-    lager:info("Recompile the DDL of these bucket types ~p", [Tables]),
-    Tables.
 
 %% ===================================================================
 %% EUnit tests
@@ -303,7 +228,7 @@ get_ddl_test() ->
             Pid = spawn(fun() -> ok end),
             ok = insert(<<"my_type">>, #ddl_v1{local_key = #key_v1{ }}, Pid, compiled),
             ?assertEqual(
-                #ddl_v1{local_key = #key_v1{ }},
+                {ok, #ddl_v1{local_key = #key_v1{ }}},
                 get_ddl(<<"my_type">>, v1)
             )
         end).

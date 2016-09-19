@@ -111,42 +111,93 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal.
 %%%
 
-%%
 %% We rely on the claimant to not give us new DDLs after the bucket
 %% type is activated, at least until we have a system in place for
 %% managing DDL versioning
-do_new_type(BucketType) ->
-    maybe_compile_ddl(BucketType,
-                      retrieve_ddl_from_metadata(BucketType),
-                      riak_kv_compile_tab:get_ddl(BucketType),
-                      riak_ql_ddl_compiler:get_compiler_version(),
-                      riak_kv_compile_tab:get_compiled_ddl_version(BucketType)).
+do_new_type(Table) ->
+    case retrieve_ddl_from_metadata(Table) of
+        undefined ->
+            log_missing_ddl_metadata(Table);
+        DDL ->
+            CurrentVersion = riak_ql_ddl:current_version(),
+            TabResult = riak_kv_compile_tab:get_ddl(
+                Table, CurrentVersion),
+            case TabResult of
+                notfound ->
+                    try
+                        %% this is a new DDL
+                        DDLVersion = riak_ql_ddl:ddl_record_version(DDL),
+                        case riak_ql_ddl:is_version_greater(CurrentVersion, DDLVersion) of
+                            false ->
+                                %% the version is too high, this is not happening!
+                                ok;
+                            true ->
+                                ok
+                        end,
+                        log_compiling_new_type(Table),
+                        DDLs = riak_ql_ddl:convert(CurrentVersion, DDL),
+                        [riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- DDLs],
+                        %% TODO also insert downgraded versions as far back as we can go
+                        actually_compile_ddl(Table, NewDDL)
+                    catch
+                        throw:unknown_version ->
+                            log_unknown_ddl_version(Table, VersionAtom)
+                    end;
+                {ok, DDL} ->
+                    log_new_type_is_duplicate(Table);
+                {ok, StoredDDL} ->
+                    %% there is a different DDL for the same table/version
+                    %% FIXME recompile anyway? That is the current behaviour
+                    ok
+            end
+    end.
 
-maybe_compile_ddl(BucketType, NewDDL, NewDDL, NewVsn, NewVsn) ->
-    lager:info("Not compiling DDL for bucket type ~s because it is unchanged", [BucketType]),
-    %% Do nothing; we're seeing a CMD update but the DDL hasn't changed
-    ok;
-maybe_compile_ddl(BucketType, NewDDL, NewDDL, NewVsn, OldVsn) when is_record(NewDDL, ?DDL_RECORD_NAME),
-                                                                   is_integer(NewVsn), is_integer(OldVsn) ->
-    lager:info("Recompiling same DDL for bucket type ~s from version ~b to ~b",
-               [BucketType, OldVsn, NewVsn]),
-    actually_compile_ddl(BucketType, NewDDL);
-maybe_compile_ddl(BucketType, NewDDL, _OldDDL, NewVsn, OldVsn) when is_record(NewDDL, ?DDL_RECORD_NAME),
-                                                                    is_integer(OldVsn), is_integer(NewVsn) ->
-    lager:info("Compiling new DDL for bucket type ~s from version ~b to ~b",
-               [BucketType, OldVsn, NewVsn]),
-    actually_compile_ddl(BucketType, NewDDL);
-maybe_compile_ddl(BucketType, NewDDL, _OldDDL, NewVsn, notfound) when is_record(NewDDL, ?DDL_RECORD_NAME),
-                                                                      is_integer(NewVsn) ->
-    lager:info("Compiling new DDL for bucket type ~s with version ~b",
-               [BucketType, NewVsn]),
-    actually_compile_ddl(BucketType, NewDDL);
-maybe_compile_ddl(BucketType, NewDDL, _OldDDL, NewVsn, OldVsn) ->
-    lager:error("Unknown DDL version type ~p for bucket type ~s "
-                "(expecting ~p with old version ~p, new version ~p)",
-                [NewDDL, BucketType, ?DDL_RECORD_NAME, OldVsn, NewVsn]),
-    %% We don't know what to do with this new DDL, so stop
-    ok.
+%%
+log_missing_ddl_metadata(Table) ->
+    lager:info("No 'ddl' property in the metata for bucket type ~s",
+        [Table]).
+
+%%
+log_compiling_new_type(Table) ->
+    lager:info("Compiling new DDL for bucket type ~s with version ~p",
+               [Table, riak_ql_ddl:current_version()]).
+
+log_new_type_is_duplicate(Table) ->
+    lager:info("Not compiling DDL for bucket type ~s because it is unchanged",
+        [Table]).
+
+%%
+log_unknown_ddl_version(Table, VersionAtom) ->
+        lager:error(
+            "Unknown DDL version type ~p for bucket type ~s "
+            "(expecting ~p with old version ~p, new version ~p)",
+                [VersionAtom, Table, ?DDL_RECORD_NAME, OldVsn, NewVsn]).
+
+% maybe_compile_ddl(BucketType, NewDDL, NewDDL, NewVsn, NewVsn) ->
+%     lager:info("Not compiling DDL for bucket type ~s because it is unchanged", [BucketType]),
+%     %% Do nothing; we're seeing a CMD update but the DDL hasn't changed
+%     ok;
+% maybe_compile_ddl(BucketType, NewDDL, NewDDL, NewVsn, OldVsn) when is_record(NewDDL, ?DDL_RECORD_NAME),
+%                                                                    is_integer(NewVsn), is_integer(OldVsn) ->
+%     lager:info("Recompiling same DDL for bucket type ~s from version ~b to ~b",
+%                [BucketType, OldVsn, NewVsn]),
+    
+% maybe_compile_ddl(BucketType, NewDDL, _OldDDL, NewVsn, OldVsn) when is_record(NewDDL, ?DDL_RECORD_NAME),
+%                                                                     is_integer(OldVsn), is_integer(NewVsn) ->
+%     lager:info("Compiling new DDL for bucket type ~s from version ~b to ~b",
+%                [BucketType, OldVsn, NewVsn]),
+%     actually_compile_ddl(BucketType, NewDDL);
+% maybe_compile_ddl(BucketType, NewDDL, _OldDDL, NewVsn, notfound) when is_record(NewDDL, ?DDL_RECORD_NAME),
+%                                                                       is_integer(NewVsn) ->
+%     lager:info("Compiling new DDL for bucket type ~s with version ~b",
+%                [BucketType, NewVsn]),
+%     actually_compile_ddl(BucketType, NewDDL);
+% maybe_compile_ddl(BucketType, NewDDL, _OldDDL, NewVsn, OldVsn) ->
+%     lager:error("Unknown DDL version type ~p for bucket type ~s "
+%                 "(expecting ~p with old version ~p, new version ~p)",
+%                 [NewDDL, BucketType, ?DDL_RECORD_NAME, OldVsn, NewVsn]),
+%     %% We don't know what to do with this new DDL, so stop
+%     ok.
 
 %%
 actually_compile_ddl(BucketType, NewDDL) ->
@@ -249,3 +300,39 @@ recompile_ddl(DDLVersion) ->
                   end,
                   Tables),
     ok.
+
+%% For each table
+%%     Find the most recent version
+%%     If the version is the most current one then continue
+%%     Else upgrade it to the current version
+%%     If the version is higher than the current version then continue (being downgraded, might not be able to check higher cos atoms)
+% upgrade_tables() ->
+%     Tables = riak_kv_compile_tab:get_all_table_names(),
+%     CurrentVersion = riak_ql_ddl:current_version(),
+%     ok.
+    
+
+% upgrade_table(Table, CurrentVersion) ->
+%     [HighestVersion|Tail] = riak_kv_compile_tab:get_compiled_ddl_versions(Table),
+%     case riak_ql_ddl:is_version_greater(CurrentVersion, HighestVersion) of
+%         equal ->
+%             %% the table is up to date, no need to upgrade
+%             ok;
+%         true ->
+%             %% upgrade, current version is greater than our persisted
+%             %% known versions
+%             {ok, DDL} = riak_kv_compile_tab:get_ddl(Table, HighestVersion),
+%             DDLs = riak_ql_ddl:convert(CurrentVersion, DDL),
+%             [riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- DDLs],
+%             ok;
+%         false ->
+%             %% downgrade, the current version is lower than the latest
+%             %% persisted version
+%             ok
+%     end.
+
+
+
+
+
+
