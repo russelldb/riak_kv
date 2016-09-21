@@ -27,12 +27,8 @@
          get_all_table_names/0,
          get_compiled_ddl_versions/1,
          get_ddl/2,
-         get_state/2,
-         get_ddl_records_needing_recompiling/1,
-         insert/4,
-         is_compiling/2,
-         new/1,
-         update_state/2]).
+         insert/2,
+         new/1]).
 
 -include_lib("riak_ql/include/riak_ql_ddl.hrl").
 
@@ -55,13 +51,19 @@
     ddl = '_' :: riak_ql_ddl:any_ddl()
  }).
 
+%% do not repair the table when we're testing, because it is always a one-shot
+%% and writes out ugly logs.
+-ifdef(TEST).
+-define(DETS_OPTIONS, [{type, set}]).
+-else.
+-define(DETS_OPTIONS, [{type, set}, {repair, force}]).
+-endif.
+
 %%
 -spec new(file:name()) -> {ok, dets:tab_name()} | error.
 new(Dir) ->
-    Options = [{type, set}, {repair, force}],
-    {ok, _} = dets:open_file(?TABLE2, [{file, file_v2(Dir)} | Options]),
-    {ok, _} = dets:open_file(?TABLE3, [{file, file_v3(Dir)}, {keypos, #row_v3.table_version } | Options]),
-    mark_compiling_for_retry().
+    {ok, _} = dets:open_file(?TABLE2, [{file, file_v2(Dir)} | ?DETS_OPTIONS]),
+    {ok, _} = dets:open_file(?TABLE3, [{file, file_v3(Dir)}, {keypos, #row_v3.table_version } | ?DETS_OPTIONS]).
 
 %% Useful testing tool
 -spec delete_dets(file:name()) ->
@@ -80,20 +82,19 @@ file_v3(Dir) ->
 
 %%
 -spec insert(BucketType :: binary(), DDL :: term()) -> ok.
-insert(BucketType, DDL) when is_binary(BucketType),
-                                                 is_tuple(DDL) ->
-    lager:info("DDL DETS Update: ~p, ~p, ~p, ~p",
-               [BucketType, DDL, CompilerPid, State]),
+insert(BucketType, DDL) when is_binary(BucketType), is_tuple(DDL) ->
+    lager:info("DDL DETS Update: ~p, ~p", [BucketType, DDL]),
     DDLVersion = riak_ql_ddl:ddl_record_version(element(1, DDL)),
     Row = #row_v3{
          table = BucketType
         ,table_version = {BucketType, DDLVersion}
-        ,ddl = DDL
-        ,compiler_pid = CompilerPid
-        ,compile_state = State },
+        ,ddl = DDL},
     ok = dets:insert(?TABLE3, Row),
     ok = dets:sync(?TABLE3),
-    ok = insert_v2(BucketType, DDL, CompilerPid, State).
+    case lists:keyfind(ddl_v1, 1, riak_ql_ddl:convert(v1, DDL)) of
+        false -> ok;
+        DDLV1 -> ok = insert_v2(BucketType, DDLV1)
+    end.
 
 %% insert into the v2 table so that the record is available
 insert_v2(BucketType, #ddl_v1{} = DDL) ->
@@ -104,16 +105,7 @@ insert_v2(BucketType, #ddl_v1{} = DDL) ->
     CompileState = compiling,
     V2Row = {BucketType, DDLVersion, DDL, self(), CompileState},
     dets:insert(?TABLE2, V2Row),
-    ok = dets:sync(?TABLE2);
-insert_v2(BucketType, DDL, CompilerPid, State) ->
-    case riak_ql_ddl:convert(v1, DDL) of
-        {error,_} ->
-            %% this DDL cannot be downgraded and cannot be used in a 
-            %% cluster containing a 1.4 node
-            ok;
-        DDLV1 ->
-            insert_v2(BucketType, DDLV1)
-    end.
+    ok = dets:sync(?TABLE2).
 
 %%
 -spec get_compiled_ddl_versions(BucketType :: binary()) ->
@@ -147,8 +139,7 @@ get_ddl(BucketType, Version) when is_binary(BucketType), is_atom(Version) ->
 %%
 -spec get_all_table_names() -> [binary()].
 get_all_table_names() ->
-    Matches = dets:match(?TABLE3, #row_v3{ table = '$1',
-                                           compile_state = compiled }),
+    Matches = dets:match(?TABLE3, #row_v3{ table = '$1' }),
     Tables = [Table || [Table] <- Matches],
     lists:usort(Tables).
 
@@ -179,43 +170,17 @@ get_all_table_names() ->
 insert_test() ->
     ?in_process(
         begin
-            Pid = spawn(fun() -> ok end),
-            ok = insert(<<"my_type">>, #ddl_v2{local_key = #key_v1{ }}, Pid, compiling),
+            ok = insert(<<"my_type">>, #ddl_v2{local_key = #key_v1{ }}),
             ?assertEqual(
-                compiling,
-                get_state(<<"my_type">>, v2)
-            )
-        end).
-
-update_state_test() ->
-    ?in_process(
-        begin
-            Pid = spawn(fun() -> ok end),
-            ok = insert(<<"my_type">>, #ddl_v1{local_key = #key_v1{ }}, Pid, compiling),
-            ok = update_state(Pid, compiled),
-            ?assertEqual(
-                compiled,
-                get_state(<<"my_type">>, v1)
-            )
-        end).
-
-is_compiling_test() ->
-    ?in_process(
-        begin
-            Type = <<"is_compiling_type">>,
-            Pid = spawn(fun() -> ok end),
-            ok = insert(Type, #ddl_v1{local_key = #key_v1{ }}, Pid, compiling),
-            ?assertEqual(
-                {true, Pid},
-                is_compiling(Type, v1)
+                {ok, #ddl_v2{local_key = #key_v1{ }}},
+                get_ddl(<<"my_type">>, v2)
             )
         end).
 
 compiled_version_test() ->
     ?in_process(
         begin
-            Pid = spawn(fun() -> ok end),
-            ok = insert(<<"my_type">>, #ddl_v1{local_key = #key_v1{ }}, Pid, compiled),
+            ok = insert(<<"my_type">>, #ddl_v1{local_key = #key_v1{ }}),
             ?assertEqual(
                 [v1],
                 get_compiled_ddl_versions(<<"my_type">>)
@@ -225,51 +190,10 @@ compiled_version_test() ->
 get_ddl_test() ->
     ?in_process(
         begin
-            Pid = spawn(fun() -> ok end),
-            ok = insert(<<"my_type">>, #ddl_v1{local_key = #key_v1{ }}, Pid, compiled),
+            ok = insert(<<"my_type">>, #ddl_v1{local_key = #key_v1{ }}),
             ?assertEqual(
                 {ok, #ddl_v1{local_key = #key_v1{ }}},
                 get_ddl(<<"my_type">>, v1)
-            )
-        end).
-
-recompile_ddl_test() ->
-    ?in_process(
-        begin
-            DDLV1 = #ddl_v1{local_key = #key_v1{ }},
-            Pid = spawn(fun() -> ok end),
-            Pid2 = spawn(fun() -> ok end),
-            Pid3 = spawn(fun() -> ok end),
-            Pid4 = spawn(fun() -> ok end),
-            ok = insert(<<"my_type1">>, DDLV1, Pid, compiling),
-            ok = insert(<<"my_type2">>, DDLV1, Pid2, compiled),
-            ok = insert(<<"my_type3">>, DDLV1, Pid3, compiling),
-            ok = insert(<<"my_type4">>, DDLV1, Pid4, compiled),
-            mark_compiling_for_retry(),
-            ?assertEqual(
-                [<<"my_type1">>,
-                 <<"my_type2">>,
-                 <<"my_type3">>
-                ],
-                lists:sort(get_ddl_records_needing_recompiling(8))
-            )
-        end).
-
-get_all_compiled_ddls_test() ->
-    ?in_process(
-        begin
-            Pid = spawn(fun() -> ok end),
-            Pid2 = spawn(fun() -> ok end),
-            Pid3 = spawn(fun() -> ok end),
-            Pid4 = spawn(fun() -> ok end),
-            ok = insert(<<"my_type1">>, {ddl_v1}, Pid, compiling),
-            ok = insert(<<"my_type2">>, {ddl_v1}, Pid2, compiled),
-            ok = insert(<<"my_type3">>, {ddl_v1}, Pid3, compiling),
-            ok = insert(<<"my_type4">>, {ddl_v1}, Pid4, compiled),
-
-            ?assertEqual(
-                [<<"my_type2">>,<<"my_type4">>],
-                get_all_table_names()
             )
         end).
 -endif.
