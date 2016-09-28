@@ -124,8 +124,9 @@ do_new_type(Table) ->
                         %% TODO also insert downgraded versions as far back as we can go
                         actually_compile_ddl(Table)
                     catch
-                        throw:unknown_version ->
-                            log_unknown_ddl_version(DDL)
+                        throw:{unknown_ddl_version, _} ->
+                            log_unknown_ddl_version(DDL),
+                            ok
                     end;
                 {ok, DDL} ->
                     log_new_type_is_duplicate(Table);
@@ -144,7 +145,7 @@ prepare_ddl_versions(CurrentVersion, ?DDL{ table = Table } = DDL) when is_binary
             %% the version is too high, this is not happening!  another node
             %% with a higher version has somehow not respected the capability
             %% and sent a version we cannot handle
-            throw(unknown_version);
+            throw(unknown_ddl_version);
         true ->
             ok;
         equal ->
@@ -183,7 +184,7 @@ actually_compile_ddl(BucketType) ->
     lager:info("Starting DDL compilation of ~s", [BucketType]),
     Self = self(),
     Ref = make_ref(),
-    _ = proc_lib:spawn_link(
+    Pid = proc_lib:spawn_link(
         fun() ->
             TabResult = riak_kv_compile_tab:get_ddl(BucketType, riak_ql_ddl:current_version()),
             {ModuleName, AST} = compile_to_ast(TabResult, BucketType),
@@ -192,8 +193,14 @@ actually_compile_ddl(BucketType) ->
             Self ! {compilation_complete, Ref}
         end),
     receive
-        {compilation_complete, Ref} -> ok
-        %% TODO capture DOWN message
+        {compilation_complete, Ref} ->
+            lager:info("Compilation of DDL ~ts complete and stored to disk", [BucketType]),
+            ok;
+        {'EXIT', Pid, normal} ->
+            ok;
+        {'EXIT', Pid, Error} ->
+            lager:error("Error compiling DDL ~ts with error ~p", [BucketType, Error]),
+            ok
     after
         30000 ->
             %% really allow a lot of time to complete this, because there is
@@ -221,6 +228,7 @@ disabled_table_source(BucketType) when is_list(BucketType) ->
 store_module(Dir, Module, Bin) ->
     Filepath = beam_file_path(Dir, Module),
     ok = filelib:ensure_dir(Filepath),
+    lager:info("STORING BEAM ~p to ~p", [Module, Filepath]),
     ok = file:write_file(Filepath, Bin).
 
 %%
@@ -275,16 +283,22 @@ upgrade_ddl(Table, CurrentVersion) ->
         true ->
             %% upgrade, current version is greater than our persisted
             %% known versions
+
             {ok, DDL} = riak_kv_compile_tab:get_ddl(Table, HighestVersion),
             DDLs = riak_ql_ddl:convert(CurrentVersion, DDL),
+            log_ddl_upgrade(DDL, DDLs),
             [riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- DDLs],
             ok;
         false ->
+            lager:info("WARNING NOT SUPPORTING DOWNGRADES YET", []),
             %% downgrade, the current version is lower than the latest
             %% persisted version, we have to hope there is a downgraded
             %% ddl in the compile tab
             ok
     end.
+
+log_ddl_upgrade(DDL, DDLs) ->
+    lager:info("UPGRADING ~p WITH ~p", [DDL, DDLs]).
 
 %% For each table
 %%     build the table name
@@ -296,11 +310,13 @@ verify_helper_modules() ->
 
 verify_helper_module(Table) when is_binary(Table) ->
     case beam_exists(Table) of
-            true ->
-                ok;
-            false ->
-                actually_compile_ddl(Table)
-        end.
+        true ->
+            lager:info("beam file for table ~ts exists", [Table]),
+            ok;
+        false ->
+            lager:info("beam file for table ~ts must be recompiled", [Table]),
+            actually_compile_ddl(Table)
+    end.
 
 %%
 beam_exists(Table) when is_binary(Table) ->

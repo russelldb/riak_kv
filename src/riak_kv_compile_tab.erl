@@ -28,7 +28,9 @@
          get_compiled_ddl_versions/1,
          get_ddl/2,
          insert/2,
-         new/1]).
+         new/1,
+         populate_v3_table/0
+        ]).
 
 -include_lib("riak_ql/include/riak_ql_ddl.hrl").
 
@@ -142,6 +144,43 @@ get_all_table_names() ->
     Matches = dets:match(?TABLE3, #row_v3{ table = '$1' }),
     Tables = [Table || [Table] <- Matches],
     lists:usort(Tables).
+
+%% ===================================================================
+%% V2 to V3 compile tab upgrade
+%% ===================================================================
+
+%%
+populate_v3_table() ->
+    [ok = maybe_insert_into_v3(T) || T <- get_all_table_names_v2()],
+    ok.
+
+maybe_insert_into_v3(BucketType) ->
+    case get_ddl(BucketType, v1)  of
+        {ok, _} ->
+            ok;
+        notfound ->
+            log_v2_to_v3_ddl_migration(BucketType),
+            {ok, DDLV2} = get_ddl_v2(BucketType),
+            insert(BucketType, DDLV2)
+    end.
+
+log_v2_to_v3_ddl_migration(BucketType) ->
+    lager:info("Moving table ~ts from compile tab v2 to v3 as part of upgrade.",
+        [BucketType]).
+
+-spec get_all_table_names_v2() -> [binary()].
+get_all_table_names_v2() ->
+    Matches = dets:match(?TABLE2, {'$1', '_', '_', '_', '_'}),
+    Tables = [Table || [Table] <- Matches],
+    lists:usort(Tables).
+
+get_ddl_v2(BucketType) when is_binary(BucketType) ->
+    case dets:lookup(?TABLE2, BucketType) of
+        [{_,_,#ddl_v1{} = DDL,_,_}] ->
+            {ok, DDL};
+        [] ->
+            notfound
+    end.
 
 %% ===================================================================
 %% EUnit tests
