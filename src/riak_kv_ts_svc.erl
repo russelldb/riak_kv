@@ -147,6 +147,7 @@ process({DDL = ?DDL{}, WithProperties}, State) ->
     create_table({DDL, WithProperties}, State);
 
 process(M = ?SQL_SELECT{'FROM' = Table}, State) ->
+    eleveldb:profile({add_event, query, seq, true}),
     check_table_and_call(Table, fun sub_tsqueryreq/4, M, State);
 
 process(M = #riak_sql_describe_v1{'DESCRIBE' = Table}, State) ->
