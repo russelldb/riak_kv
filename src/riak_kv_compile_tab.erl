@@ -107,6 +107,7 @@ insert_v2(BucketType, #ddl_v1{} = DDL) ->
     CompileState = compiling,
     V2Row = {BucketType, DDLVersion, DDL, self(), CompileState},
     dets:insert(?TABLE2, V2Row),
+    log_compile_tab_v2_inserted(BucketType),
     ok = dets:sync(?TABLE2).
 
 %%
@@ -145,6 +146,11 @@ get_all_table_names() ->
     Tables = [Table || [Table] <- Matches],
     lists:usort(Tables).
 
+%%
+log_compile_tab_v2_inserted(BucketType) ->
+    lager:info("DDL for table ~ts was stored, it can be used in Riak TS 1.4",
+    [BucketType]).
+
 %% ===================================================================
 %% V2 to V3 compile tab upgrade
 %% ===================================================================
@@ -155,7 +161,7 @@ populate_v3_table() ->
     ok.
 
 maybe_insert_into_v3(BucketType) ->
-    case get_ddl(BucketType, v1)  of
+    case get_ddl(BucketType, v1) of
         {ok, _} ->
             ok;
         notfound ->

@@ -153,29 +153,29 @@ prepare_ddl_versions(CurrentVersion, ?DDL{ table = Table } = DDL) when is_binary
     end,
     log_compiling_new_type(Table),
     %% conversions, if the DDL is greater, then we need to convert 
-    DDLs = riak_ql_ddl:convert(CurrentVersion, DDL),
-    lager:info("DDLs ~p", [DDLs]),
-    [ok = riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- DDLs],
+    UpgradedDDLs = riak_ql_ddl:convert(CurrentVersion, DDL),
+    lager:info("DDLs ~p", [UpgradedDDLs]),
+    [ok = riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- UpgradedDDLs],
     ok.
 
 %%
 log_missing_ddl_metadata(Table) ->
-    lager:info("No 'ddl' property in the metata for bucket type ~s",
+    lager:info("No 'ddl' property in the metata for bucket type ~ts",
         [Table]).
 
 %%
 log_compiling_new_type(Table) ->
-    lager:info("Compiling new DDL for bucket type ~s with version ~p",
+    lager:info("Compiling new DDL for bucket type ~ts with version ~p",
                [Table, riak_ql_ddl:current_version()]).
 
 log_new_type_is_duplicate(Table) ->
-    lager:info("Not compiling DDL for bucket type ~s because it is unchanged",
+    lager:info("Not compiling DDL for bucket type ~ts because it is unchanged",
         [Table]).
 
 %%
 log_unknown_ddl_version(DDL) ->
     lager:error(
-        "Unknown DDL version type ~p for bucket type ~s (current version is ~p)",
+        "Unknown DDL version type ~p for bucket type ~ts (current version is ~p)",
         [DDL, riak_ql_ddl:current_version()]).
 
 %%
@@ -186,11 +186,19 @@ actually_compile_ddl(BucketType) ->
     Ref = make_ref(),
     Pid = proc_lib:spawn_link(
         fun() ->
-            TabResult = riak_kv_compile_tab:get_ddl(BucketType, riak_ql_ddl:current_version()),
-            {ModuleName, AST} = compile_to_ast(TabResult, BucketType),
-            {ok, ModuleName, Bin} = compile:forms(AST),
-            ok = store_module(ddl_ebin_directory(), ModuleName, Bin),
-            Self ! {compilation_complete, Ref}
+            try   
+                TabResult = riak_kv_compile_tab:get_ddl(BucketType, riak_ql_ddl:current_version()),
+                {ModuleName, AST} = compile_to_ast(TabResult, BucketType),
+                {ok, ModuleName, Bin} = compile:forms(AST),
+                ok = store_module(ddl_ebin_directory(), ModuleName, Bin),
+                Self ! {compilation_complete, Ref}
+            after
+                %% this spawned process may crash before lager is properly
+                %% started and never write a crash report, so do a cheeky wee
+                %% sleep after a success has returned to the newtype gen_server
+                %% so only the error case is blocked
+                timer:sleep(100)
+            end
         end),
     receive
         {compilation_complete, Ref} ->
@@ -205,24 +213,18 @@ actually_compile_ddl(BucketType) ->
         30000 ->
             %% really allow a lot of time to complete this, because there is
             %% not much we can do if it fails
-            lager:error("timeout on compiling table ~s", [BucketType]),
+            lager:error("timeout on compiling table ~ts", [BucketType]),
             {error, timeout}
     end.
 
-%% TODO fix return types
 compile_to_ast(TabResult, BucketType) ->
     case TabResult of
         {ok, DDL} ->
             riak_ql_ddl_compiler:compile(DDL);
         _ ->
-            merl:quote(disabled_table_source(binary_to_list(BucketType)))
+            lager:info("No DDL for table ~ts, requests on it will not be supported.", [BucketType]),
+            riak_ql_ddl_compiler:compile_disabled_module(BucketType)
     end.
-
-%%
-disabled_table_source(BucketType) when is_list(BucketType) ->
-    "-module(" ++ BucketType ++ ").\n"
-    "-compile(export_all).\n"
-    "is_disabled() -> true.". %% TODO needs to be version number
 
 %%
 store_module(Dir, Module, Bin) ->
@@ -283,20 +285,45 @@ upgrade_ddl(Table, CurrentVersion) ->
         true ->
             %% upgrade, current version is greater than our persisted
             %% known versions
-
             {ok, DDL} = riak_kv_compile_tab:get_ddl(Table, HighestVersion),
             DDLs = riak_ql_ddl:convert(CurrentVersion, DDL),
             log_ddl_upgrade(DDL, DDLs),
-            [riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- DDLs],
+            [ok = riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- DDLs],
+            DowngradedDDLs = riak_ql_ddl:convert(riak_ql_ddl:first_version(), DDL),
+            [ok = insert_downgraded_ddl(Table, DDLx) || DDLx <- DowngradedDDLs],
             ok;
         false ->
-            lager:info("WARNING NOT SUPPORTING DOWNGRADES YET", []),
             %% downgrade, the current version is lower than the latest
             %% persisted version, we have to hope there is a downgraded
             %% ddl in the compile tab
             ok
     end.
 
+insert_downgraded_ddl(BucketType, {error, {cannot_downgrade, Version}}) ->
+    log_cannot_downgrade_to_version(BucketType, Version);
+insert_downgraded_ddl(BucketType, DDL) ->
+    DDLVersion = riak_ql_ddl:ddl_record_version(element(1, DDL)),
+    case riak_kv_compile_tab:get_ddl(BucketType, DDLVersion) of
+        {ok,_} ->
+            %% the DDL already exists, so don't overwrite it
+            ok;
+        notfound ->
+            log_storing_downgraded_ddl(BucketType, DDLVersion),
+            riak_kv_compile_tab:insert(BucketType, DDL)
+    end.
+
+%%
+log_storing_downgraded_ddl(BucketType, DDLVersion) when is_atom(DDLVersion) ->
+    lager:info("A DDL for table ~ts for DDL version ~p was stored, for use "
+               "in the event of a downgrade", [BucketType, DDLVersion]).
+
+%%
+log_cannot_downgrade_to_version(BucketType, Version) ->
+    lager:warn("Cannot downgrade table ~ts to version ~p, "
+              "table will be disablded under this version",
+                [BucketType, Version]).
+
+%%
 log_ddl_upgrade(DDL, DDLs) ->
     lager:info("UPGRADING ~p WITH ~p", [DDL, DDLs]).
 
