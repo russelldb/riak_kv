@@ -894,7 +894,7 @@ clear_tree(State=#state{index=Index}) ->
     State3#state{built=false, expired=false}.
 
 destroy_trees(State) ->
-    State2 = close_trees(State),
+    State2 = close_trees(State, true),
     {_,Tree0} = hd(State#state.trees), % deliberately using state with live db ref
     _ = hashtree:destroy(Tree0),
     State2.
@@ -967,9 +967,12 @@ maybe_rebuild(State) ->
 has_index_tree(Trees) ->
     orddict:is_key(?INDEX_2I_N, Trees).
 
-close_trees(State=#state{trees=undefined}) ->
+close_trees(State) ->
+    close_trees(State, false).
+
+close_trees(State=#state{trees=undefined}, _WillDestroy) ->
     State;
-close_trees(State=#state{trees=Trees}) ->
+close_trees(State=#state{trees=Trees}, false) ->
     Trees2 = [begin
                   NewTree = try
                                 case hashtree:next_rebuild(Tree) of
@@ -991,8 +994,16 @@ close_trees(State=#state{trees=Trees}) ->
                             end,
                   {IdxN, NewTree}
               end || {IdxN, Tree} <- Trees],
-    _ = [hashtree:close(Tree) || {_IdxN, Tree} <- Trees2],
-    State#state{trees=undefined}.
+    really_close_trees(Trees2, State);
+
+close_trees(#state{trees=Trees} = State, true) ->
+    really_close_trees(Trees, State).
+
+really_close_trees(Trees, State) ->
+    lists:foreach(fun really_close_tree/1, Trees),
+    State#state{trees = undefined}.
+
+really_close_tree({_IdxN, Tree}) -> hashtree:close(Tree).
 
 get_all_locks(Type, Index, Pid) ->
     case riak_kv_entropy_manager:get_lock(Type, Pid) of
