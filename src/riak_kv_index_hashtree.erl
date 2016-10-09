@@ -521,12 +521,12 @@ hash_index_data(IndexData) when is_list(IndexData) ->
 %% before the fold reaches the now out-of-date version of the object, the old
 %% key/hash pair will be ignored.
 %% If `HasIndexTree` is true, also update the index spec tree.
--spec fold_keys(index(), pid(), partition(), boolean()) -> non_neg_integer() | {error, term()}.
+-spec fold_keys(index(), pid(), partition(), boolean()) -> ok.
 fold_keys(Partition, HashtreePid, Index, HasIndexTree) ->
     FoldFun = fold_fun(HashtreePid, HasIndexTree),
     {Limit, Wait} = get_build_throttle(),
     Req = riak_core_util:make_fold_req(FoldFun,
-                                       {0, Limit, Wait}, false,
+                                       {0, {Limit, Wait}}, false,
                                        [aae_reconstruction,
                                         {iterator_refresh, true}]),
     Result = riak_core_vnode_master:sync_command({Partition, node()},
@@ -537,10 +537,10 @@ fold_keys(Partition, HashtreePid, Index, HasIndexTree) ->
 
 %% The accumulator in the fold is the number of bytes hashed
 %% modulo the "build limit" size. If we get an int back, everything is ok
-handle_fold_keys_result(Result, Index, HashtreePid) when is_integer(Result) ->
+handle_fold_keys_result({Result, {_Limit, _Delay}}, HashtreePid, Index) when is_integer(Result) ->
     lager:info("Finished AAE tree build: ~p", [Index]),
     gen_server:cast(HashtreePid, build_finished);
-handle_fold_keys_result(Result, Index, HashtreePid) ->
+handle_fold_keys_result(Result, HashtreePid, Index) ->
     lager:error("Failed to build hashtree for index ~p. Result was: ~p", [Index, Result]),
     gen_server:cast(HashtreePid, build_failed).
 
