@@ -44,13 +44,9 @@ rewrite_cast({vnode_map, {Partition,_Node},
     {ok, Req};
 rewrite_cast({vnode_put, {Partition,_Node},
               {FSM_pid,BKey,RObj,ReqID,FSMTime,Options}}) ->
+    KvReq = riak_kv_requests:new_put_request(BKey, RObj, ReqID, FSMTime, Options),
     Req = riak_core_vnode_master:make_request(
-            ?KV_PUT_REQ{
-               bkey = BKey,
-               object = RObj,
-               req_id = ReqID,
-               start_time = FSMTime,
-               options = Options},
+            KvReq,
             {fsm, undefined, FSM_pid},
             Partition),
     {ok, Req};

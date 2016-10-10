@@ -280,13 +280,10 @@ put(Preflist, BKey, Obj, ReqId, StartTime, Options) when is_integer(StartTime) -
 
 put(Preflist, BKey, Obj, ReqId, StartTime, Options, Sender)
   when is_integer(StartTime) ->
+    Req = riak_kv_requests:new_put_request(
+        sanitize_bkey(BKey), Obj, ReqId, StartTime, Options),
     riak_core_vnode_master:command(Preflist,
-                                   ?KV_PUT_REQ{
-                                      bkey = sanitize_bkey(BKey),
-                                      object = Obj,
-                                      req_id = ReqId,
-                                      start_time = StartTime,
-                                      options = Options},
+                                   Req,
                                    Sender,
                                    riak_kv_vnode_master).
 
@@ -330,15 +327,7 @@ coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options) when is_integer(Start
 
 coord_put(IndexNode, BKey, Obj, ReqId, StartTime, Options, Sender)
   when is_integer(StartTime) ->
-    riak_core_vnode_master:command(IndexNode,
-                                   ?KV_PUT_REQ{
-                                      bkey = sanitize_bkey(BKey),
-                                      object = Obj,
-                                      req_id = ReqId,
-                                      start_time = StartTime,
-                                      options = [coord | Options]},
-                                   Sender,
-                                   riak_kv_vnode_master).
+    put([IndexNode], BKey, Obj, ReqId, StartTime, [coord | Options], Sender).
 
 %% Do a put without sending any replies
 readrepair(Preflist, BKey, Obj, ReqId, StartTime, Options) ->
@@ -534,16 +523,20 @@ init([Index]) ->
     end.
 
 
-handle_overload_command(?KV_PUT_REQ{}, Sender, Idx) ->
-    riak_core_vnode:reply(Sender, {fail, Idx, overload});
 handle_overload_command(?KV_GET_REQ{req_id=ReqID}, Sender, Idx) ->
     riak_core_vnode:reply(Sender, {r, {error, overload}, Idx, ReqID});
 handle_overload_command(?KV_VNODE_STATUS_REQ{}, Sender, Idx) ->
     riak_core_vnode:reply(Sender, {vnode_status, Idx, [{error, overload}]});
 handle_overload_command(?KV_W1C_PUT_REQ{type=Type}, Sender, _Idx) ->
     riak_core_vnode:reply(Sender, ?KV_W1C_PUT_REPLY{reply={error, overload}, type=Type});
-handle_overload_command(_, Sender, _) ->
+handle_overload_command(Req, Sender, Idx) ->
+    handle_overload_request(riak_kv_requests:request_type(Req), Req, Sender, Idx).
+
+handle_overload_request(kv_put_request, _Req, Sender, Idx) ->
+    riak_core_vnode:reply(Sender, {fail, Idx, overload});
+handle_overload_request(_, _Req, Sender, _Idx) ->
     riak_core_vnode:reply(Sender, {error, mailbox_overload}).
+
 
 %% Handle all SC overload messages here
 handle_overload_info({ensemble_ping, _From}, _Idx) ->
@@ -559,18 +552,6 @@ handle_overload_info({raw_forward_get, _, From}, _Idx) ->
     riak_kv_ensemble_backend:reply(From, {error, vnode_overload});
 handle_overload_info(_, _) ->
     ok.
-
-handle_command(?KV_PUT_REQ{bkey=BKey,
-                           object=Object,
-                           req_id=ReqId,
-                           start_time=StartTime,
-                           options=Options},
-               Sender, State=#state{idx=Idx}) ->
-    StartTS = os:timestamp(),
-    riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
-    {_Reply, UpdState} = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
-    update_vnode_stats(vnode_put, Idx, StartTS),
-    {noreply, UpdState};
 
 handle_command(?KV_GET_REQ{bkey=BKey,req_id=ReqId},Sender,State) ->
     do_get(Sender, BKey, ReqId, State);
@@ -900,7 +881,22 @@ handle_command(?KV_W1C_PUT_REQ{bkey={Bucket, Key}, encoded_obj=EncodedVal, type=
             {reply, ?KV_W1C_PUT_REPLY{reply=ok, type=Type}, State#state{modstate=UpModState}};
         {error, Reason, UpModState} ->
             {reply, ?KV_W1C_PUT_REPLY{reply={error, Reason}, type=Type}, State#state{modstate=UpModState}}
-    end.
+    end;
+handle_command(Req, Sender, State) ->
+    handle_request(riak_kv_requests:request_type(Req), Req, Sender, State).
+
+
+%% @todo: pre record encapsulation there was no catch all clause in handle_command,
+%%        so crashing on unknown should work.
+handle_request(kv_put_request, Req, Sender, #state{idx = Idx} = State) ->
+    StartTS = os:timestamp(),
+    ReqId = riak_kv_requests:get_request_id(Req),
+    riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
+    {_Reply, UpdState} = do_put(Sender, Req, State),
+    update_vnode_stats(vnode_put, Idx, StartTS),
+    {noreply, UpdState}.
+
+
 
 %% @doc Handle a coverage request.
 %% More information about the specification for the ItemFilter
@@ -1064,42 +1060,6 @@ handle_coverage_fold(FoldType, Bucket, ItemFilter, ResultFun,
 %% that was already handed off.  This is benign as the tombstone will
 %% eventually be re-deleted. NOTE: this makes write requests N+M where
 %% M is the number of vnodes forwarding.
-handle_handoff_command(Req=?KV_PUT_REQ{}, Sender, State) ->
-    ?KV_PUT_REQ{options=Options} = Req,
-    case proplists:get_value(coord, Options, false) of
-        false ->
-            {noreply, NewState} = handle_command(Req, Sender, State),
-            {forward, NewState};
-        true ->
-            %% riak_kv#1046 - don't make fake siblings. Perform the
-            %% put, and create a new request to forward on, that
-            %% contains the frontier, much like the value returned to
-            %% a put fsm, then replicated.
-            #state{idx=Idx} = State,
-            ?KV_PUT_REQ{bkey=BKey,
-                        object=Object,
-                        req_id=ReqId,
-                        start_time=StartTime,
-                        options=Options} = Req,
-            StartTS = os:timestamp(),
-            riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
-            {Reply, UpdState} = do_put(Sender, BKey,  Object, ReqId, StartTime, Options, State),
-            update_vnode_stats(vnode_put, Idx, StartTS),
-
-            case Reply of
-                %%  NOTE: Coord is always `returnbody` as a put arg
-                {dw, Idx, NewObj, ReqId} ->
-                    %% DO NOT coordinate again at the next owner!
-                    NewReq = Req?KV_PUT_REQ{options=proplists:delete(coord, Options),
-                                            object=NewObj},
-                    {forward, NewReq, UpdState};
-                _Error ->
-                    %% Don't forward a failed attempt to put, as you
-                    %% need the successful object
-                    {noreply, UpdState}
-            end
-    end;
-
 handle_handoff_command(?KV_W1C_PUT_REQ{}=Request, Sender, State) ->
     NewState0 = case handle_command(Request, Sender, State) of
         {noreply, NewState} ->
@@ -1112,19 +1072,55 @@ handle_handoff_command(?KV_W1C_PUT_REQ{}=Request, Sender, State) ->
     end,
     {forward, NewState0};
 
-%% Handle all unspecified cases locally without forwarding
 handle_handoff_command(Req, Sender, State) ->
+    ReqType = riak_kv_requests:request_type(Req),
+    handle_handoff_request(ReqType, Req, Sender, State).
+
+handle_handoff_request(kv_put_request, Req, Sender, State) ->
+    case riak_kv_requests:is_coordinated_put(Req) of
+        false ->
+            {noreply, NewState} = handle_command(Req, Sender, State),
+            {forward, NewState};
+        true ->
+            %% riak_kv#1046 - don't make fake siblings. Perform the
+            %% put, and create a new request to forward on, that
+            %% contains the frontier, much like the value returned to
+            %% a put fsm, then replicated.
+            #state{idx = Idx} = State,
+            ReqId = riak_kv_requests:get_request_id(Req),
+            StartTS = os:timestamp(),
+            riak_core_vnode:reply(Sender, {w, Idx, ReqId}),
+            {Reply, UpdState} = do_put(Sender, Req, State),
+            update_vnode_stats(vnode_put, Idx, StartTS),
+
+            case Reply of
+                %%  NOTE: Coord is always `returnbody` as a put arg
+                {dw, Idx, NewObj, ReqId} ->
+                    %% DO NOT coordinate again at the next owner!
+                    NewReq1 = riak_kv_requests:remove_option(Req, coord),
+                    NewReq = riak_kv_requests:set_object(NewReq1, NewObj),
+                    {forward, NewReq, UpdState};
+                _Error ->
+                    %% Don't forward a failed attempt to put, as you
+                    %% need the successful object
+                    {noreply, UpdState}
+            end
+    end;
+handle_handoff_request(_Other, Req, Sender, State) ->
+    %% @todo: this should be based on the type of the request when the
+    %%        hiding of records is complete.
     handle_command(Req, Sender, State).
+
+
+
 
 %% callback used by dynamic ring sizing to determine where
 %% requests should be forwarded. Puts/deletes are forwarded
 %% during the operation, all other requests are not
-request_hash(?KV_PUT_REQ{bkey=BKey}) ->
-    riak_core_util:chash_key(BKey);
 request_hash(?KV_DELETE_REQ{bkey=BKey}) ->
     riak_core_util:chash_key(BKey);
-request_hash(_Req) ->
-    undefined.
+request_hash(Req) ->
+    riak_kv_requests:request_hash(Req).
 
 handoff_starting({_HOType, TargetNode}=_X, State=#state{handoffs_rejected=RejectCount}) ->
     MaxRejects = app_helper:get_env(riak_kv, handoff_rejected_max, 6),
@@ -1406,6 +1402,15 @@ raw_put({Idx, Node}, Key, Obj) ->
     %% Note: This cannot be bang_unreliable. Don't change.
     Proxy ! {raw_put, Key, Obj},
     ok.
+
+%% @private
+do_put(Sender, Request, State) ->
+    BKey = riak_kv_requests:get_bucket_key(Request),
+    Object = riak_kv_requests:get_object(Request),
+    RequestId = riak_kv_requests:get_request_id(Request),
+    StartTime = riak_kv_requests:get_start_time(Request),
+    Options = riak_kv_requests:get_options(Request),
+    do_put(Sender, BKey, Object, RequestId, StartTime, Options, State).
 
 %% @private
 %% upon receipt of a client-initiated put
@@ -2813,17 +2818,16 @@ clean_test_dirs() ->
 backend_with_known_key(BackendMod) ->
     dummy_backend(BackendMod),
     {ok, S1} = init([0]),
-    B = <<"f">>,
-    K = <<"b">>,
-    O = riak_object:new(B, K, <<"z">>),
-    {noreply, S2} = handle_command(?KV_PUT_REQ{bkey={B,K},
-                                               object=O,
-                                               req_id=123,
-                                               start_time=riak_core_util:moment(),
-                                               options=[]},
-                                   {raw, 456, self()},
-                                   S1),
-    {S2, B, K}.
+    Bucket = <<"f">>,
+    Key = <<"b">>,
+    Object = riak_object:new(Bucket, Key, <<"z">>),
+    Sender = {raw, 456, self()},
+    BucketKey = {Bucket, Key},
+    RequestId = 123,
+    {noreply, S2} = handle_command(
+        riak_kv_requests:new_put_request(BucketKey, Object, RequestId, riak_core_util:moment(), []),
+        Sender, S1),
+    {S2, Bucket, Key}.
 
 list_buckets_test_() ->
     {foreach,
@@ -2929,20 +2933,21 @@ bitcask_badcrc_test() ->
     riak_core_metadata_manager:start_link([{data_dir, "kv_vnode_test_meta"}]),
     riak_core_bg_manager:start(),
     clean_test_dirs(),
-    {S, B, K} = backend_with_known_key(riak_kv_bitcask_backend),
+    {S, Bucket, Key} = backend_with_known_key(riak_kv_bitcask_backend),
     DataDir = filename:join(bitcask_test_dir(), "0"),
     [DataFile] = filelib:wildcard(DataDir ++ "/*.data"),
     {ok, Fh} = file:open(DataFile, [read, write]),
     ok = file:pwrite(Fh, ?HEADER_SIZE, <<0>>),
     file:close(Fh),
-    O = riak_object:new(B, K, <<"y">>),
-    {noreply, _} = handle_command(?KV_PUT_REQ{bkey={B,K},
-                                               object=O,
-                                               req_id=123,
-                                               start_time=riak_core_util:moment(),
-                                               options=[]},
-                                   {raw, 456, self()},
-                                   S),
+    Object = riak_object:new(Bucket, Key, <<"y">>),
+    Sender = {raw, 456, self()},
+    RequestId = 123,
+    StartTime = riak_core_util:moment(),
+    Options = [],
+    {noreply, _} = handle_command(
+        riak_kv_requests:new_put_request({Bucket, Key}, Object, RequestId, StartTime, Options),
+        Sender,
+        S),
     riak_core_ring_manager:cleanup_ets(test),
     riak_kv_test_util:stop_process(riak_core_metadata_manager),
     riak_kv_test_util:stop_process(riak_core_bg_manager),
