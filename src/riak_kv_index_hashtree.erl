@@ -1011,7 +1011,7 @@ close_trees(#state{trees=Trees} = State, true) ->
     really_close_trees(Trees, State).
 
 really_close_trees(Trees, State) ->
-    _ = [hashtree:close(Tree) || {_IdxN, Tree} <- Trees],
+    lists:foreach(fun({_IdxN, Tree}) -> hashtree:close(Tree) end, Trees),
     State#state{trees = undefined}.
 
 -spec get_all_locks(build | rehash, index(), pid()) -> boolean().
