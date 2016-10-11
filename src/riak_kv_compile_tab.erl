@@ -197,7 +197,7 @@ get_ddl_v2(BucketType) when is_binary(BucketType) ->
 
 -define(in_process(TestCode),
     Self = self(),
-    spawn_monitor(
+    Pid = spawn_monitor(
         fun() ->
             _ = riak_kv_compile_tab:delete_dets("."),
             _ = riak_kv_compile_tab:new("."),
@@ -206,18 +206,18 @@ get_ddl_v2(BucketType) when is_binary(BucketType) ->
         end),
     receive
         test_ok -> ok;
-        {'DOWN',_,_,_,normal} -> ok;
-        {'DOWN',_,_,_,Error} -> error(Error);
-        Error -> error(Error)
+        {'DOWN',_,_,Pid,normal} -> ok;
+        {'DOWN',_,_,Pid,Error} -> error(Error)
     end
 ).
 
 insert_test() ->
     ?in_process(
         begin
-            ok = insert(<<"my_type">>, #ddl_v2{local_key = #key_v1{ }}),
+            DDLV2 = #ddl_v2{local_key = #key_v1{ }, partition_key = #key_v1{ }},
+            ok = insert(<<"my_type">>, DDLV2),
             ?assertEqual(
-                {ok, #ddl_v2{local_key = #key_v1{ }}},
+                {ok, DDLV2},
                 get_ddl(<<"my_type">>, v2)
             )
         end).

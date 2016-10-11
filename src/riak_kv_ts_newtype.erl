@@ -61,12 +61,18 @@ new_type(BucketType) ->
     gen_server:cast(?MODULE, {new_type, BucketType}).
 
 %%
+-spec is_compiled(binary(), riak_ql_ddl:any_ddl()) -> boolean().
 is_compiled(BucketType, DDL) when is_binary(BucketType) ->
-    CurrentVersion = riak_ql_ddl:current_version(),
-    (beam_exists(BucketType)
-        andalso riak_kv_compile_tab:get_ddl(BucketType, CurrentVersion) == {ok, DDL}).
-    % IsCompiled = (riak_kv_compile_tab:get_state(BucketType) == compiled andalso
-    %               riak_kv_compile_tab:get_ddl(BucketType) == DDL).
+    DDLVersion = riak_ql_ddl:ddl_record_version(element(1,DDL)),
+    %% if an operator changed his/her mind and submitted another definition for
+    %% the DDL shortly after the first, it’s theoretically possible the first
+    %% would be compiled on some and the second on others
+    %%
+    %% even if we're running an upgraded version of the DDL, the DDL argument
+    %% is from the metadata and will still be the old version so find the
+    %% original that was stored and compare that
+    (beam_exists(BucketType) andalso
+        riak_kv_compile_tab:get_ddl(BucketType, DDLVersion) == {ok, DDL}).
 
 %%%
 %%% gen_server.
@@ -120,12 +126,11 @@ do_new_type(Table) ->
             case riak_kv_compile_tab:get_ddl(Table, CurrentVersion) of
                 notfound ->
                     try
-                        ok = prepare_ddl_versions(CurrentVersion, DDL),
-                        %% TODO also insert downgraded versions as far back as we can go
+                        ok = prepare_ddl_versions(Table, CurrentVersion, DDL),
                         actually_compile_ddl(Table)
                     catch
-                        throw:{unknown_ddl_version, _} ->
-                            log_unknown_ddl_version(DDL),
+                        throw:unknown_ddl_version ->
+                            log_unknown_ddl_version(Table, DDL),
                             ok
                     end;
                 {ok, DDL} ->
@@ -133,30 +138,33 @@ do_new_type(Table) ->
                 {ok, _StoredDDL} ->
                     %% there is a different DDL for the same table/version
                     %% FIXME recompile anyway? That is the current behaviour
+                    %% this cannot happen because of the is_compiled check
                     ok
             end
     end.
 
-prepare_ddl_versions(CurrentVersion, ?DDL{ table = Table } = DDL) when is_binary(Table), is_atom(CurrentVersion) ->
+prepare_ddl_versions(Table, CurrentVersion, DDL) when is_binary(Table), is_atom(CurrentVersion) ->
     %% this is a new DDL
-    DDLVersion = riak_ql_ddl:ddl_record_version(element(1, DDL)),
-    case riak_ql_ddl:is_version_greater(CurrentVersion, DDLVersion) of
+    case is_known_ddl_version(CurrentVersion, DDL) of
         false ->
-            %% the version is too high, this is not happening!  another node
-            %% with a higher version has somehow not respected the capability
-            %% and sent a version we cannot handle
+            %% the version is unknown!  another node with a higher version has
+            %% somehow not respected the capability and sent a version we
+            %% cannot handle
             throw(unknown_ddl_version);
         true ->
-            ok;
-        equal ->
             ok
     end,
     log_compiling_new_type(Table),
-    %% conversions, if the DDL is greater, then we need to convert 
+    %% conversions, if the DDL is greater, then we need to convert
     UpgradedDDLs = riak_ql_ddl:convert(CurrentVersion, DDL),
-    lager:info("DDLs ~p", [UpgradedDDLs]),
+    % lager:info("DDLs ~p", [UpgradedDDLs]),
     [ok = riak_kv_compile_tab:insert(Table, DDLx) || DDLx <- UpgradedDDLs],
     ok.
+
+%%
+is_known_ddl_version(CurrentVersion, DDL) ->
+    DDLVersion = riak_ql_ddl:ddl_record_version(element(1, DDL)),
+    riak_ql_ddl:is_version_greater(CurrentVersion, DDLVersion) /= false.
 
 %%
 log_missing_ddl_metadata(Table) ->
@@ -168,25 +176,26 @@ log_compiling_new_type(Table) ->
     lager:info("Compiling new DDL for bucket type ~ts with version ~p",
                [Table, riak_ql_ddl:current_version()]).
 
+%%
 log_new_type_is_duplicate(Table) ->
-    lager:info("Not compiling DDL for bucket type ~ts because it is unchanged",
+    lager:info("Not compiling DDL for table ~ts because it is unchanged",
         [Table]).
 
 %%
-log_unknown_ddl_version(DDL) ->
+log_unknown_ddl_version(Table, DDL) ->
     lager:error(
-        "Unknown DDL version type ~p for bucket type ~ts (current version is ~p)",
-        [DDL, riak_ql_ddl:current_version()]).
+        "Unknown DDL version ~p for bucket type ~ts (current version is ~p)",
+        [DDL, Table, riak_ql_ddl:current_version()]).
 
 %%
 -spec actually_compile_ddl(BucketType::binary()) -> pid().
 actually_compile_ddl(BucketType) ->
-    lager:info("Starting DDL compilation of ~s", [BucketType]),
+    lager:info("Starting DDL compilation of ~ts", [BucketType]),
     Self = self(),
     Ref = make_ref(),
     Pid = proc_lib:spawn_link(
         fun() ->
-            try   
+            try
                 TabResult = riak_kv_compile_tab:get_ddl(BucketType, riak_ql_ddl:current_version()),
                 {ModuleName, AST} = compile_to_ast(TabResult, BucketType),
                 {ok, ModuleName, Bin} = compile:forms(AST),
@@ -243,9 +252,8 @@ ddl_ebin_directory() ->
    DataDir = app_helper:get_env(riak_core, platform_data_dir),
    filename:join(DataDir, ddl_ebin).
 
-%% Would be nice to have a function in riak_core_bucket_type or
-%% similar to get either the prefix or the actual metadata instead
-%% of including a riak_core header file for this prefix
+%% The returned DDL may not be the current DDL record, it could be
+%% an old one.
 retrieve_ddl_from_metadata(BucketType) when is_binary(BucketType) ->
     retrieve_ddl_2(riak_core_metadata:get(?BUCKET_TYPE_PREFIX, BucketType,
                                           [{allow_put, false}])).
@@ -320,7 +328,7 @@ log_storing_downgraded_ddl(BucketType, DDLVersion) when is_atom(DDLVersion) ->
 %%
 log_cannot_downgrade_to_version(BucketType, Version) ->
     lager:warn("Cannot downgrade table ~ts to version ~p, "
-              "table will be disablded under this version",
+               "table will be disablded under this version",
                 [BucketType, Version]).
 
 %%
@@ -352,6 +360,23 @@ beam_exists(Table) when is_binary(Table) ->
     filelib:is_file(beam_file_path(BeamDir, ModuleName)).
 
 
+%% ===================================================================
+%% EUnit tests
+%% ===================================================================
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
+is_known_ddl_version_v2_test() ->
+    ?assertEqual(
+        true,
+        is_known_ddl_version(v2, #ddl_v2{})
+    ).
 
+is_known_ddl_version_v1_test() ->
+    ?assertEqual(
+        true,
+        is_known_ddl_version(v2, #ddl_v1{})
+    ).
+
+-endif.
