@@ -866,7 +866,7 @@ handle_command(?KV_W1C_PUT_REQ{bkey={Bucket, Key}, encoded_obj=EncodedVal, type=
                 From, State=#state{mod=Mod, idx=Idx, async_put=true, modstate=ModState}) ->
     StartTS = os:timestamp(),
     Context = {w1c_async_put, From, Type, Bucket, Key, EncodedVal, StartTS},
-    case Mod:sync_put(Context, Bucket, Key, EncodedVal, ModState) of
+    case Mod:async_put(Context, Bucket, Key, EncodedVal, ModState) of
         {ok, UpModState} ->
 
             update_hashtree(Bucket, Key, EncodedVal, State),
