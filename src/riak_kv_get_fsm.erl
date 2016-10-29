@@ -145,7 +145,7 @@ test_link(From, Bucket, Key, GetOptions, StateProps) ->
 %% ====================================================================
 
 %% @private
-init([From, Bucket, Key, Options0, Monitor]) ->
+init([From, Bucket, Key, Options0]) ->
     StartNow = os:timestamp(),
     Options = proplists:unfold(Options0),
     StateData = #state{from = From,

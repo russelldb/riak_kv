@@ -226,7 +226,7 @@ test_link(From, Object, PutOptions, StateProps) ->
 %% ====================================================================
 
 %% @private
-init([From, RObj, Options0, Monitor]) ->
+init([From, RObj, Options0]) ->
     BKey = {Bucket, Key} = {riak_object:bucket(RObj), riak_object:key(RObj)},
     CoordTimeout = get_put_coordinator_failure_timeout(),
     Trace = app_helper:get_env(riak_kv, fsm_trace_enabled),

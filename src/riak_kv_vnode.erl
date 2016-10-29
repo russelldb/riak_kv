@@ -1664,7 +1664,7 @@ actual_put(BKey={Bucket, Key}, Obj, IndexSpecs, RB, ReqID, MaxCheckFlag,
                         mod=Mod,
                         modstate=ModState}) ->
     case encode_and_put(Obj, Mod, Bucket, Key, IndexSpecs, ModState,
-                       do_max_check) of
+                       MaxCheckFlag) of
         {{ok, UpdModState}, EncodedVal} ->
             update_hashtree(Bucket, Key, EncodedVal, State),
             maybe_cache_object(BKey, Obj, State),
