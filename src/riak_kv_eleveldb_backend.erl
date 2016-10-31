@@ -208,7 +208,7 @@ put(Bucket, PrimaryKey, IndexSpecs, Val, #state{ref=Ref,
 
 async_put(Context, Bucket, PrimaryKey, Val, #state{ref=Ref, write_opts=WriteOpts}=State) ->
     StorageKey = to_object_key(Bucket, PrimaryKey),
-    case eleveldb:async_put(Ref, Context, StorageKey, Val, WriteOpts) of
+    case eleveldb:async_put2(Ref, Context, StorageKey, Val, WriteOpts) of
         {error, Reason} ->
             {error, Reason, State};
         Result ->  %% Can be 'ok' or Context
