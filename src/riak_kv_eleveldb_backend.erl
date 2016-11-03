@@ -425,7 +425,10 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{fold_opts=FoldOpts,
     %% Set up the fold...
     FirstKey = to_first_key(Limiter),
     FoldFun = fold_keys_fun(FoldKeysFun, Limiter),
-    FoldOpts1 = [{start_key, FirstKey} | FoldOpts],
+
+    FoldOpts1 = [{start_key,   FirstKey},
+		 {fold_method, streaming} | FoldOpts],
+
     ExtraFold = not FixedIdx orelse WriteLegacyIdx,
     KeyFolder =
         fun() ->
