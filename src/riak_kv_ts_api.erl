@@ -135,7 +135,7 @@ put_data_to_partitions(Data, Bucket, BucketProps, DDL, Mod) ->
     CappedBatchSize = app_helper:get_env(riak_kv, timeseries_max_batch_size,
                                          1024 * 1024),
     EncodeFn =
-        fun(O) -> riak_object:to_binary(v1, O, erlang) end,
+        fun(O) -> riak_object:to_binary(v1, O, msgpack) end,
 
     {ReqIds, FailReqs} =
         lists:foldl(
