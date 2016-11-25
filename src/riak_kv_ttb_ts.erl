@@ -49,14 +49,37 @@ decode(?TTB_MSG_CODE, Bin) ->
     Msg = riak_ttb_codec:decode(Bin),
     DecodedReq =
         case Msg of
-            #tsqueryreq{query = Q,
-                        cover_context = Cover,
-                        allow_qbuf_reuse = AllowQBufReuse} ->
-                riak_kv_ts_svc:decode_query_common(Q, [{cover, Cover}, {allow_qbuf_reuse, AllowQBufReuse}]);
-            #tsgetreq{table = Table}->
+            %% avoid matching on #tsapicallreq to be able to serve
+            %% requests from older clients, which would send us an
+            %% earlier version of the record.
+            {tsqueryreq,
+             Query, _Stream, CoverContext, AllowQBufReuse} ->
+                riak_kv_ts_svc:decode_query_common(
+                  Query, [{cover, CoverContext}, {allow_qbuf_reuse, AllowQBufReuse}]);
+            {tsqueryreq,
+             Query, _Stream, CoverContext} ->
+                riak_kv_ts_svc:decode_query_common(
+                  Query, [{cover, CoverContext}]);
+
+            {tsgetreq,
+             Table, _Key, _Timeout} ->
                 {ok, Msg, {riak_kv_ts_api:api_call_to_perm(get), Table}};
-            #tsputreq{table = Table} ->
-                {ok, Msg, {riak_kv_ts_api:api_call_to_perm(put), Table}}
+
+            {tsputreq,
+             Table, _Columns, _Rows} ->
+                {ok, Msg, {riak_kv_ts_api:api_call_to_perm(put), Table}};
+
+            {tsdelreq,
+             Table, _Key, _Vclock, _Timeout} ->
+                {ok, Msg, {riak_kv_ts_api:api_call_to_perm(delete), Table}};
+
+            {tslistkeysreq,
+             Table, _Timeout} ->
+                {ok, Msg, {riak_kv_ts_api:api_call_to_perm(list_keys), Table}};
+
+            {tscoveragereq,
+             _Query, Table, _ReplaceCover, _UnavailableCover} ->
+                {ok, Msg, {riak_kv_ts_api:api_call_to_perm(coverage), Table}}
         end,
     DDLRecCap = riak_core_capability:get({riak_kv, riak_ql_ddl_rec_version}),
     riak_kv_ts_util:check_table_feature_supported(DDLRecCap, DecodedReq).
