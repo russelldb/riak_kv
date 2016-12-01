@@ -435,7 +435,7 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{fold_opts=FoldOpts,
                 %% Do the fold. ELevelDB uses throw/1 to break out of a fold...
                 AccFinal =
                     try
-                        eleveldb:fold_keys(Ref, FoldFun, Acc, FoldOpts1)
+                        eleveldb:fold(Ref, FoldFun, Acc, FoldOpts1)
                     catch
                         {break, BrkResult} ->
                             BrkResult
@@ -866,7 +866,15 @@ fold_keys_fun(FoldKeysFun, {index, FilterBucket, Q=?KV_INDEX_Q{return_terms=Term
 
     %% User indexes
     fun(StorageKey, Acc) ->
-            IndexKey = from_index_key(StorageKey),
+
+            IndexKey = 
+		case StorageKey of
+		    {SKey, _SVal} ->
+			from_index_key(SKey);
+		    _ ->
+			from_index_key(StorageKey)
+		end,
+
             case riak_index:index_key_in_range(IndexKey, FilterBucket, Q) of
                 {true, {Bucket, Key, _Field, Term}} ->
                     Val = if
