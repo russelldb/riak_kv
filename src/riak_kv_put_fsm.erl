@@ -320,7 +320,10 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
             %% Check if this node is in the preference list so it can coordinate
             LocalPL = [IndexNode || {{_Index, Node} = IndexNode, _Type} <- Preflist2,
                                 Node == node()],
-            Must = (get_option(asis, Options, false) /= true),
+            LWW = get_option(last_write_wins, BucketProps, false) =:= true,
+            DisableIndex = get_option(disable_index, BucketProps) =:= true,
+            AsIs = get_option(asis, Options, false) =:= true,
+            Must = not (AsIs orelse (LWW andalso DisableIndex)),
             case {Preflist2, LocalPL =:= [] andalso Must == true} of
                 {[], _} ->
                     %% Empty preflist
