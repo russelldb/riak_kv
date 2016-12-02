@@ -1486,7 +1486,8 @@ prepare_put(State=#state{vnodeid=VId,
     %% old object to know how the indexes have changed.
     IndexBackend = is_indexed_backend(Mod, Bucket, ModState),
     IsSearchable = ?IS_SEARCH_ENABLED_FOR_BUCKET(BProps),
-    SkipReadBeforeWrite = LWW andalso (not IndexBackend) andalso (not IsSearchable),
+    IndexingDisabled = proplists:get_value(disable_index, BProps, false),
+    SkipReadBeforeWrite = LWW andalso (not IndexBackend or IndexingDisabled) andalso (not IsSearchable),
     case SkipReadBeforeWrite of
         true ->
             prepare_blind_put(Coord, RObj, VId, StartTime, PutArgs, State);
