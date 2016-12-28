@@ -42,7 +42,7 @@ basic_schema_test() ->
     Config = cuttlefish_unit:generate_templated_config(
         ["../priv/riak_kv.schema", "../priv/multi_backend.schema"], [], context(), predefined_schema()),
 
-    cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy", {off, []}),
+    cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy", {on, []}),
     cuttlefish_unit:assert_config(Config, "riak_kv.storage_backend", riak_kv_eleveldb_backend),
     cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy_build_limit", {1, 3600000}),
     cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy_expire", 604800000),
@@ -237,7 +237,7 @@ multi_backend_test() ->
     Config = cuttlefish_unit:generate_templated_config(
         ["../priv/riak_kv.schema", "../priv/multi_backend.schema"], Conf, context(), predefined_schema()),
 
-    cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy", {off, []}),
+    cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy", {on, []}),
     cuttlefish_unit:assert_config(Config, "riak_kv.storage_backend", riak_kv_multi_backend),
     cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy_build_limit", {1, 3600000}),
     cuttlefish_unit:assert_config(Config, "riak_kv.anti_entropy_expire", 604800000),
