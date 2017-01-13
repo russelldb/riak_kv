@@ -433,8 +433,7 @@ do_batch_put(QBufRef, Data, #state{qbufs      = QBufs0,
 -spec add_chunk(#qbuf{}, [data_row()],
                 non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
                        {ok, #qbuf{}, non_neg_integer()} | {error, total_qbuf_size_limit_reached | riak_kv_qry_buffers_ldb:errors()}.
-add_chunk(#qbuf{inmem_buffer  = InmemBuffer0,
-                orig_qry      = ?SQL_SELECT{'ORDER BY' = OrderBy},
+add_chunk(#qbuf{orig_qry      = ?SQL_SELECT{'ORDER BY' = OrderBy},
                 chunks_got    = ChunksGot0,
                 chunks_need   = ChunksNeed,
                 size          = Size,
@@ -458,33 +457,48 @@ add_chunk(#qbuf{inmem_buffer  = InmemBuffer0,
             ChunksGot = ChunksGot0 + 1,
             AllChunksReceived = (ChunksNeed == ChunksGot),
 
-            %% construct keys for new data
-            OrdByFieldQualifiers = lists:map(fun get_ordby_field_qualifiers/1, OrderBy),
+            %% 'enkey', or entuple with the artificial, unique key
+            %% constructed from ORDER BY specs.  Now the records are
+            %% ready to be merged with the chunks already accumulated
+            OrdByFieldQualifiers =
+                [{OrdBySpec, NullsSpec} || {_Fld, OrdBySpec, NullsSpec} <- OrderBy],
             KeyedData = enkey(Data, KeyFieldPositions, OrdByFieldQualifiers, ChunkId),
 
+            %% Defer the (potentially costly) sorting
+            MaybeSortedChunkF =
+                fun(to_go) ->
+                        %% if the chunk is to go to the backend, we
+                        %% don't need to sort it here because it
+                        %% doesn't matter in which order we do
+                        %% eleveldb:put
+                        KeyedData;
+                   (for_here) ->
+                        %% if the chunk stays in memory, then we want
+                        %% to keep the key, pre-sort using it, for it
+                        %% to be lists:merge-able.  The in-mem
+                        %% accumulator keeps the data in the order the
+                        %% client expects
+                        lists:sort(KeyedData)
+                end,
             QBuf1 = QBuf0#qbuf{size          = Size + ChunkSize,
                                chunks_got    = ChunksGot,
                                total_records = TotalRecords0 + length(Data),
                                last_accessed = os:timestamp(),
                                all_chunks_received = AllChunksReceived},
-            lager:debug("adding chunk ~b of ~b to ldb", [ChunksGot, ChunksNeed]),
+            lager:debug("adding chunk ~b of ~b", [ChunksGot, ChunksNeed]),
             store_chunk(
-              QBuf1,
-              %% both the existing accumulated chunks as well as the
-              %% newly added chunk are already sorted, so perhaps a
-              %% more intelligent way would be to insert the new chunk
-              %% at the right place.
-              lists:append(InmemBuffer0, KeyedData),
-              can_afford_inmem(InmemMax),
-              AllChunksReceived)
+              QBuf1, MaybeSortedChunkF, can_afford_inmem(InmemMax), AllChunksReceived)
     end.
 
-store_chunk(#qbuf{ldb_ref = LdbRef,
+
+store_chunk(#qbuf{inmem_buffer  = InmemBuffer0,
+                  ldb_ref       = LdbRef,
                   ldb_setup_fun = DelayedCreateFun} = QBuf0,
-            Data, CanAffordInMem, AllChunksReceived) ->
+            PreparedDataF, CanAffordInMem, AllChunksReceived) ->
     EleveldbPutF =
         fun(Ref) ->
-                case riak_kv_qry_buffers_ldb:add_rows(Ref, Data) of
+                ChunkToGo = lists:merge(InmemBuffer0, PreparedDataF(to_go)),
+                case riak_kv_qry_buffers_ldb:add_rows(Ref, ChunkToGo) of
                     ok ->
                         QBuf = QBuf0#qbuf{inmem_buffer = [],
                                           ldb_ref      = Ref},
@@ -498,8 +512,9 @@ store_chunk(#qbuf{ldb_ref = LdbRef,
     case (IsBackendOpened                %% already storing to backend: keep doing so
           orelse not CanAffordInMem) of  %% can't keep in memory: switch to backend
         false ->
-            InmemBuffer = lists:sort(Data),
-            QBuf = QBuf0#qbuf{inmem_buffer = maybe_only_rows(InmemBuffer, AllChunksReceived)},
+            ChunkToStayInMem = lists:merge(InmemBuffer0, PreparedDataF(for_here)),
+            QBuf = QBuf0#qbuf{inmem_buffer =
+                                  maybe_only_rows(ChunkToStayInMem, AllChunksReceived)},
             {ok, QBuf};
         true when IsBackendOpened ->
             EleveldbPutF(LdbRef);
@@ -518,9 +533,6 @@ can_afford_inmem(Threshold) ->
     StackSize = proplists:get_value(stack_size, PInfo),
     Allocated = HeapSize - StackSize,
     Allocated < Threshold.
-
-get_ordby_field_qualifiers({_, AscDesc, Nulls}) ->
-    {AscDesc, Nulls}.
 
 maybe_only_rows(KeyedRows, _StripKeysUsedForSorting = false) ->
     %% while collecting chunks, we keep keyed data
