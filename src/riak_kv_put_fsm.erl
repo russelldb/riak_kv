@@ -169,21 +169,25 @@ get_put_coordinator_failure_timeout() ->
     app_helper:get_env(riak_kv, put_coordinator_failure_timeout, 3000).
 
 make_ack_options(Options) ->
-    case (riak_core_capability:get(
-            {riak_kv, put_fsm_ack_execute}, disabled) == disabled
-          orelse not
-          app_helper:get_env(
-            riak_kv, retry_put_coordinator_failure, true)) of
+    case should_skip_coordinator_retry(Options) of
         true ->
             {false, Options};
         false ->
-            case get_option(retry_put_coordinator_failure, Options, true) of
-                true ->
-                    {true, [{ack_execute, self()}|Options]};
-                _Else ->
-                    {false, Options}
-            end
+            {true, [{ack_execute, self()}|Options]}
     end.
+
+should_skip_coordinator_retry(Options) ->
+    NotCapableOfAckExecute = riak_core_capability:get(
+        {riak_kv, put_fsm_ack_execute}, disabled) == disabled,
+    DoNotRetryPutCoordinatorFailure = not app_helper:get_env(
+        riak_kv, retry_put_coordinator_failure, true),
+    RetryDisabledViaOptions = not get_option(retry_put_coordinator_failure, Options, true),
+    determine_skip_coordinator_retry(NotCapableOfAckExecute, DoNotRetryPutCoordinatorFailure, RetryDisabledViaOptions).
+
+determine_skip_coordinator_retry(_NotCapable=false, _DoNotRetrySetting=false, _RetryDisabledViaOptions=false) ->
+    false;
+determine_skip_coordinator_retry(_NotCapable, _DoNotRetrySetting, _RetryDisabledViaOptions) ->
+    true.
 
 spawn_coordinator_proc(CoordNode, Mod, Fun, Args) ->
     %% If the net_kernel cannot talk to CoordNode, then any variation
@@ -235,11 +239,13 @@ init([From, RObj, Options0, Monitor]) ->
     CoordTimeout = get_put_coordinator_failure_timeout(),
     Trace = application:get_env(riak_kv, fsm_trace_enabled),
     Options = proplists:unfold(Options0),
+    BadCoordinators = get_option(bad_coordinators, Options, []),
     StateData = #state{from = From,
                        robj = RObj,
                        bkey = BKey,
                        trace = Trace,
                        options = Options,
+                       bad_coordinators = BadCoordinators,
                        timing = riak_kv_fsm_timing:add_timing(prepare, []),
                        coordinator_timeout=CoordTimeout},
     (Monitor =:= true) andalso riak_kv_get_put_monitor:put_fsm_spawned(self()),
@@ -283,6 +289,7 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                                      options = Options,
                                      trace = Trace,
                                      bad_coordinators = BadCoordinators}) ->
+    maybe_send_ack(Options),
     {ok, DefaultProps} = application:get_env(riak_core, 
                                              default_bucket_props),
     BucketProps = riak_core_bucket:get_bucket(riak_object:bucket(RObj)),
@@ -341,11 +348,11 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                     ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
                             ["prepare", atom2list(CoordNode)]),
                     try
-                        {UseAckP, Options2} = make_ack_options(
-                                               [{ack_execute, self()}|Options]),
+                        {UseAckP, Options2} = make_ack_options(Options),
+                        Options3 = [{bad_coordinators, BadCoordinators} | Options2],
                         MiddleMan = spawn_coordinator_proc(
                                       CoordNode, riak_kv_put_fsm, start_link,
-                                      [From,RObj,Options2]),
+                                      [From,RObj,Options3]),
                         ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
                                 ["prepare", atom2list(CoordNode)]),
                         ok = riak_kv_stat:update(coord_redir),
@@ -384,6 +391,21 @@ prepare(timeout, StateData0 = #state{from = From, robj = RObj,
                             ["prepare", CoordPlNode]),
                     new_state_timeout(validate, StateData)
             end
+    end.
+
+%% @private
+
+maybe_send_ack(Options) ->
+    %% If we are a forwarded coordinator, the originating node is expecting
+    %% an ack from us.
+    %% NOTE: This ack used to be sent in the execute state, but it is necessary
+    %% to send earlier to resolve issues described in https://github.com/basho/riak_kv/issues/1188.
+    %% Leaving the atom as `ack_execute' to avoid requiring a new capability.
+    case get_option(ack_execute, Options) of
+        undefined ->
+            ok;
+        Pid ->
+            Pid ! {ack, node(), now_executing}
     end.
 
 %% @private
@@ -517,15 +539,7 @@ precommit(timeout, State = #state{precommit = [Hook | Rest],
     end.
 
 %% @private
-execute(State=#state{options = Options, coord_pl_entry = CPL}) ->
-    %% If we are a forwarded coordinator, the originating node is expecting
-    %% an ack from us.
-    case get_option(ack_execute, Options) of
-        undefined ->
-            ok;
-        Pid ->
-            Pid ! {ack, node(), now_executing}
-    end,
+execute(State=#state{coord_pl_entry = CPL}) ->
     case CPL of
         undefined ->
             execute_remote(State);
