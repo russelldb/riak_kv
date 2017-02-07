@@ -256,7 +256,7 @@ init([From, RObj, Options0, Monitor]) ->
                        bad_coordinators = BadCoordinators,
                        timing = riak_kv_fsm_timing:add_timing(prepare, []),
                        coordinator_timeout=CoordTimeout},
-    (Monitor =:= true) andalso riak_kv_get_put_monitor:put_fsm_spawned(self()),
+    maybe_spawn_put_monitor(Monitor),
     case Trace of
         true ->
             riak_core_dtrace:put_tag([Bucket, $,, Key]),
@@ -290,6 +290,11 @@ init({test, Args, StateProps}) ->
     %% Enter into the validate state, skipping any code that relies on the
     %% state of the rest of the system
     {ok, validate, TestStateData}.
+
+maybe_spawn_put_monitor(true) ->
+    riak_kv_get_put_monitor:put_fsm_spawned(self());
+maybe_spawn_put_monitor(false) ->
+    ok.
 
 %% @private
 prepare(timeout, StateData0 = #state{from = From, robj = RObj,
