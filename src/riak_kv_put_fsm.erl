@@ -47,7 +47,7 @@
          waiting_remote_vnode/2,
          postcommit/2, finish/2]).
 
--export([executing_ack/2]).
+-export([executing_ack/1]).
 
 -type detail_info() :: timing.
 -type detail() :: true |
@@ -869,14 +869,26 @@ invoke_hook({struct, Hook}=HookDef, RObj) ->
     Mod = get_option(<<"mod">>, Hook),
     Fun = get_option(<<"fun">>, Hook),
     JSName = get_option(<<"name">>, Hook),
-    if (Mod == undefined orelse Fun == undefined) andalso JSName == undefined ->
+    case hook_type(Mod, Fun, JSName) of
+        invalid_hook ->
             {error, {invalid_hook_def, HookDef}};
-       true -> invoke_hook(Mod, Fun, JSName, RObj)
+        erlang_hook ->
+            invoke_erlang_hook(Mod, Fun, RObj);
+        js_hook ->
+            invoke_js_hook(JSName, RObj)
     end;
 invoke_hook(HookDef, _RObj) ->
     {error, {invalid_hook_def, HookDef}}.
 
-invoke_hook(Mod0, Fun0, undefined, RObj) when Mod0 /= undefined, Fun0 /= undefined ->
+hook_type(undefined, undefined, JSName) when JSName /= undefined ->
+    js_hook;
+hook_type(Mod, Fun, undefined) when Mod /= undefined andalso Fun /= undefined ->
+    erlang_hook;
+hook_type(_, _, _) ->
+    invalid_hook.
+
+
+invoke_erlang_hook(Mod0, Fun0, RObj) ->
     Mod = binary_to_atom(Mod0, utf8),
     Fun = binary_to_atom(Fun0, utf8),
     try
@@ -884,11 +896,10 @@ invoke_hook(Mod0, Fun0, undefined, RObj) when Mod0 /= undefined, Fun0 /= undefin
     catch
         Class:Exception ->
             {erlang, {Mod, Fun}, {'EXIT', Mod, Fun, Class, Exception}}
-    end;
-invoke_hook(undefined, undefined, JSName, RObj) when JSName /= undefined ->
-    {js, JSName, riak_kv_js_manager:blocking_dispatch(?JSPOOL_HOOK, {{jsfun, JSName}, RObj}, 5)};
-invoke_hook(_, _, _, _) ->
-    {error, {invalid_hook_def, no_hook}}.
+    end.
+
+invoke_js_hook(JSName, RObj) ->
+    {js, JSName, riak_kv_js_manager:blocking_dispatch(?JSPOOL_HOOK, {{jsfun, JSName}, RObj}, 5)}.
 
 -spec decode_precommit(any(), boolean()) -> fail | {fail, any()} | 
                                             riak_object:riak_object().
