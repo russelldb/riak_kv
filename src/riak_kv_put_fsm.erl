@@ -47,6 +47,8 @@
          waiting_remote_vnode/2,
          postcommit/2, finish/2]).
 
+-export([executing_ack/2]).
+
 -type detail_info() :: timing.
 -type detail() :: true |
                   false |
@@ -175,6 +177,12 @@ make_ack_options(Options) ->
         false ->
             {true, [{ack_execute, self()}|Options]}
     end.
+
+%% Called locally to let the remote Pid know that we are now executing and the remote Pid may stop running.
+executing_ack(Pid) ->
+    Pid ! {ack, node(), now_executing}.
+
+
 
 should_skip_coordinator_retry(Options) ->
     NotCapableOfAckExecute = riak_core_capability:get(
@@ -405,7 +413,7 @@ maybe_send_ack(Options) ->
         undefined ->
             ok;
         Pid ->
-            Pid ! {ack, node(), now_executing}
+            executing_ack(Pid)
     end.
 
 %% @private
