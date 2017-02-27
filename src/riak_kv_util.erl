@@ -46,7 +46,8 @@
          consistent_object/1,
          overload_reply/1,
          get_backend_config/3,
-         is_modfun_allowed/2]).
+         is_modfun_allowed/2,
+         get_random_element/1]).
 
 -include_lib("riak_kv_vnode.hrl").
 
@@ -435,6 +436,10 @@ is_modfun_allowed(Mod, _Fun) ->
         _ ->
             true
     end.
+
+get_random_element(List) ->
+    {ListPos, _} = random:uniform_s(length(List), os:timestamp()),
+    lists:nth(ListPos, List).
 
 %% ===================================================================
 %% EUnit tests

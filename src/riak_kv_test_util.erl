@@ -98,7 +98,14 @@ wait_for_pid(Pid) ->
             ok
     after
         5000 ->
-            {error, didnotexit, Pid, erlang:process_info(Pid)}
+            Status =
+                try
+                    sys:get_status(Pid)
+                catch
+                    _:_ ->
+                        no_status
+                end,
+            {error, didnotexit, Pid, erlang:process_info(Pid), Status}
     end.
 
 %% @doc Wait for registered process to exit.
