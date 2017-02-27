@@ -291,9 +291,11 @@ maybe_spawn_put_monitor(false = _Monitor) ->
 
 %% @private
 prepare({start, prepare}, State = #state{robj = RObj,
-                                     bkey = BKey = {Bucket, _Key},
-                                     options = Options,
-                                     bad_coordinators = BadCoordinators}) ->
+                                         bkey = BKey = {Bucket, _Key},
+                                         from = From,
+                                         options = Options,
+                                         trace = Trace,
+                                         bad_coordinators = BadCoordinators}) ->
     {BucketProps, EffectiveProps} = get_effective_bucket_props(RObj, Bucket),
     DocIdx = riak_core_util:chash_key(BKey, BucketProps),
     N = get_effective_n_val(BucketProps, Options),
@@ -301,67 +303,66 @@ prepare({start, prepare}, State = #state{robj = RObj,
         {error, _} = Error ->
             process_reply(Error, State);
         _ ->
-            EffectivePreflist = get_effective_preflist(Options, DocIdx, N, BadCoordinators),
-            %% Check if this node is in the preference list so it can coordinate
-            LocalPL = get_local_preflist_entries(EffectivePreflist),
-            ShouldUpateVclock = determine_should_update_vclock(Options),
-            determine_prepare_result(EffectivePreflist, LocalPL, ShouldUpateVclock, BucketProps, N,
-                                     EffectiveProps, State)
+            case coordination_outcome(Options, DocIdx, N, BadCoordinators) of
+                all_nodes_down ->
+                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1],
+                            ["prepare", <<"all nodes down">>]),
+                    process_reply({error, all_nodes_down}, State);
+                {redirect, CoordNode} ->
+                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
+                            ["prepare", atom2list(CoordNode)]),
+                    try
+                        {UseAckP, Options2} = make_ack_options(
+                            [{ack_execute, self()} | Options]),
+                        Options3 = [{bad_coordinators, BadCoordinators} | Options2],
+                        {MiddleMan, CoordinatorTRef} =
+                            riak_kv_put_fsm_comm:start_remote_coordinator(
+                                CoordNode, [From,RObj,Options3],
+                                State#state.coordinator_timeout),
+                        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
+                                ["prepare", atom2list(CoordNode)]),
+                        ok = riak_kv_stat:update(coord_redir),
+                        maybe_await_remote_coordinator(UseAckP, MiddleMan,
+                                                       CoordNode, CoordinatorTRef, State)
+                    catch
+                        _:Reason ->
+                            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
+                                    ["prepare", dtrace_errstr(Reason)]),
+                            lager:error("Unable to forward put for ~p to ~p - ~p @ ~p\n",
+                                        [BKey, CoordNode, Reason, erlang:get_stacktrace()]),
+                            process_reply({error, {coord_handoff_failed, Reason}}, State)
+                    end;
+                {coordinator, CoordPLEntry, EffectivePreflist} ->
+                    maybe_trace_prepare(Trace, CoordPLEntry),
+                    StatTracked = get_option(stat_tracked, BucketProps, false),
+                    StartTime = riak_core_util:moment(),
+                    State1 = State#state{n              = N,
+                                         bucket_props   = EffectiveProps,
+                                         coord_pl_entry = CoordPLEntry,
+                                         preflist2      = EffectivePreflist,
+                                         starttime      = StartTime,
+                                         tracked_bucket = StatTracked},
+                    start_new_state(validate, State1)
+            end
     end.
 
-determine_prepare_result(_EffectivePreflist=[], _LocalPL, _ShouldUpateVclock, _BucketProps, _N, _Props,
-                         #state{trace = Trace}=State) ->
-    %% Empty preflist
-    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1],
-            ["prepare", <<"all nodes down">>]),
-    process_reply({error, all_nodes_down}, State);
-determine_prepare_result(EffectivePreflist, _LocalPL=[], _ShouldUpateVclock=true, _BucketProps, _N, _Props,
-                         #state{from = From,
-                                options = Options,
-                                robj = RObj,
-                                bkey = BKey,
-                                trace = Trace,
-                                bad_coordinators = BadCoordinators} = State) ->
-    %% This node is not in the preference list
-    %% forward on to a random node
-    CoordNode = get_random_coordinating_node(EffectivePreflist),
-    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
-            ["prepare", atom2list(CoordNode)]),
-    try
-        {UseAckP, Options2} = make_ack_options(
-            [{ack_execute, self()} | Options]),
-        Options3 = [{bad_coordinators, BadCoordinators} | Options2],
-        {MiddleMan, CoordinatorTRef} =
-            riak_kv_put_fsm_comm:start_remote_coordinator(
-                CoordNode, [From,RObj,Options3],
-                State#state.coordinator_timeout),
-        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
-                ["prepare", atom2list(CoordNode)]),
-        ok = riak_kv_stat:update(coord_redir),
-        maybe_await_remote_coordinator(UseAckP, MiddleMan,
-                                       CoordNode, CoordinatorTRef, State)
-    catch
-        _:Reason ->
-            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
-                    ["prepare", dtrace_errstr(Reason)]),
-            lager:error("Unable to forward put for ~p to ~p - ~p @ ~p\n",
-                        [BKey, CoordNode, Reason, erlang:get_stacktrace()]),
-            process_reply({error, {coord_handoff_failed, Reason}}, State)
-    end;
-determine_prepare_result(EffectivePreflist, LocalPL, ShouldUpdateVClock, BucketProps, N, Props,
-                         #state{trace = Trace} = State0) ->
-    %% Putting asis, or at least one vnode in the preflist is local
-    CoordPLEntry = get_local_coordinating_preflist_entry(ShouldUpdateVClock, LocalPL),
-    maybe_trace_prepare(Trace, CoordPLEntry),
-    StatTracked = get_option(stat_tracked, BucketProps, false),
-    StartTime = riak_core_util:moment(),
-    State = State0#state{n              = N,
-                         bucket_props   = Props,
-                         coord_pl_entry = CoordPLEntry,
-                         preflist2      = EffectivePreflist,
-                         starttime      = StartTime,
-                         tracked_bucket = StatTracked},
-    start_new_state(validate, State).
+coordination_outcome(Options, DocIdx, N, BadCoordinators) ->
+    case get_effective_preflist(Options, DocIdx, N, BadCoordinators) of
+        [] ->
+            all_nodes_down;
+        EffectivePreflist ->
+            LocalPL = get_local_preflist_entries(EffectivePreflist),
+            ShouldUpdateVclock = determine_should_update_vclock(Options),
+            coordinator_selection(ShouldUpdateVclock, LocalPL, EffectivePreflist)
+    end.
+
+coordinator_selection(true = _ShouldUpdateVclock, [] = _LocalPL, EffectivePreflist) ->
+    % this node is not in the preflist, foward to random node
+    CoordinatingNode = get_random_coordinating_node(EffectivePreflist),
+    {redirect, CoordinatingNode};
+coordinator_selection(ShouldUpdateVclock, LocalPL, EffectivePreflist) ->
+    CoordPLEntry = get_local_coordinating_preflist_entry(ShouldUpdateVclock, LocalPL),
+    {coordinator, CoordPLEntry, EffectivePreflist}.
 
 get_random_coordinating_node(EffectivePreflist) ->
     {{_Idx, CoordNode}, _Type} = riak_kv_util:get_random_element(EffectivePreflist),
