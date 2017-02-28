@@ -295,8 +295,16 @@ prepare({start, prepare}, State = #state{robj = RObj,
     DocIdx = riak_core_util:chash_key(BKey, BucketProps),
     N = get_effective_n_val(BucketProps, Options),
     case coordination_outcome(Options, DocIdx, N, BadCoordinators) of
+        %% TODO: Should we create a `process_error' function separate from
+        %% `process_reply' so we don't overload what `process_reply' means?
         {error, _} = Error ->
             process_reply(Error, State);
+        redirect_ignored ->
+            %% TODO: in future version of Riak, add a `nack_execute' message
+            %% rather than just stopping - will allow us to communicate our unwillingness
+            %% to coordinate back to the calling process rather than making it time out
+            %% will need a new capability in order to support mixed clusters
+            {stop, normal, State};
         {coordinator, _CoordPLEntry, _EffectivePreflist} = CoordinationOutcome->
             process_coordination_outcome(CoordinationOutcome,
                                          State#state{bucket_props = EffectiveProps,
@@ -306,11 +314,21 @@ prepare({start, prepare}, State = #state{robj = RObj,
             process_coordination_outcome(CoordinationOutcome, State)
     end.
 
+maybe_ack(#state{options = Options}) ->
+    %% If we are a forwarded coordinator, the originating node is expecting
+    %% an ack from us.
+    case get_option(ack_execute, Options) of
+        undefined ->
+            ok;
+        Pid ->
+            executing_ack(Pid)
+    end.
 
 process_coordination_outcome(all_nodes_down,
                              #state{trace = Trace} = State) ->
     ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1],
             ["prepare", <<"all nodes down">>]),
+    maybe_ack(State),
     process_reply({error, all_nodes_down}, State);
 process_coordination_outcome({redirect, CoordNode},
                              #state{options = Options,
@@ -345,6 +363,7 @@ process_coordination_outcome({redirect, CoordNode},
     end;
 process_coordination_outcome({coordinator, CoordPLEntry, EffectivePreflist},
                              #state{trace = Trace} = State) ->
+    maybe_ack(State),
     maybe_trace_prepare(Trace, CoordPLEntry),
     StartTime = riak_core_util:moment(),
     State1 = State#state{coord_pl_entry = CoordPLEntry,
@@ -362,14 +381,24 @@ coordination_outcome(Options, DocIdx, N, BadCoordinators) ->
         EffectivePreflist ->
             LocalPL = get_local_preflist_entries(EffectivePreflist),
             ShouldUpdateVclock = determine_should_update_vclock(Options),
-            coordinator_selection(ShouldUpdateVclock, LocalPL, EffectivePreflist)
+            IsRedirect = request_was_redirected(Options),
+            coordinator_selection(IsRedirect, ShouldUpdateVclock, LocalPL, EffectivePreflist)
     end.
 
-coordinator_selection(true = _ShouldUpdateVclock, [] = _LocalPL, EffectivePreflist) ->
+request_was_redirected(Options) ->
+    get_option(ack_execute, Options) =/= undefined.
+coordinator_selection(true = _IsRedirect, _ShouldUpdateVclock, [] = _LocalPL, _EffectivePreflist) ->
+    %% This request was redirected to us, but we think it should be redirected.
+    %% This can indicate that the ring may not be consistent across the cluster.
+    %% We don't want to redirect again here, but we should force a ring broadcast
+    %% to try to get the original node and this node to agree on ownership.
+    riak_core_ring_manager:force_update(),
+    redirect_ignored;
+coordinator_selection(_IsRedirect, true = _ShouldUpdateVclock, [] = _LocalPL, EffectivePreflist) ->
     % this node is not in the preflist, foward to random node
     CoordinatingNode = get_random_coordinating_node(EffectivePreflist),
     {redirect, CoordinatingNode};
-coordinator_selection(ShouldUpdateVclock, LocalPL, EffectivePreflist) ->
+coordinator_selection(_IsRedirect, ShouldUpdateVclock, LocalPL, EffectivePreflist) ->
     CoordPLEntry = get_local_coordinating_preflist_entry(ShouldUpdateVclock, LocalPL),
     {coordinator, CoordPLEntry, EffectivePreflist}.
 
@@ -582,15 +611,7 @@ precommit(Event, State = #state{precommit = [Hook | Rest],
     end.
 
 %% @private
-execute(State=#state{options = Options, coord_pl_entry = CPL}) ->
-    %% If we are a forwarded coordinator, the originating node is expecting
-    %% an ack from us.
-    case get_option(ack_execute, Options) of
-        undefined ->
-            ok;
-        Pid ->
-            executing_ack(Pid)
-    end,
+execute(State=#state{coord_pl_entry = CPL}) ->
     case CPL of
         undefined ->
             execute_remote(State);
