@@ -23,9 +23,6 @@
 %% @doc coordination of Riak PUT requests
 
 -module(riak_kv_put_fsm).
-%-ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
-%-endif.
 -include_lib("riak_kv_vnode.hrl").
 -include_lib("riak_kv_js_pools.hrl").
 -include("riak_kv_wm_raw.hrl").
@@ -292,60 +289,72 @@ maybe_spawn_put_monitor(false = _Monitor) ->
 %% @private
 prepare({start, prepare}, State = #state{robj = RObj,
                                          bkey = BKey = {Bucket, _Key},
-                                         from = From,
                                          options = Options,
-                                         trace = Trace,
                                          bad_coordinators = BadCoordinators}) ->
     {BucketProps, EffectiveProps} = get_effective_bucket_props(RObj, Bucket),
     DocIdx = riak_core_util:chash_key(BKey, BucketProps),
     N = get_effective_n_val(BucketProps, Options),
-    case N of
+    case coordination_outcome(Options, DocIdx, N, BadCoordinators) of
         {error, _} = Error ->
             process_reply(Error, State);
-        _ ->
-            case coordination_outcome(Options, DocIdx, N, BadCoordinators) of
-                all_nodes_down ->
-                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1],
-                            ["prepare", <<"all nodes down">>]),
-                    process_reply({error, all_nodes_down}, State);
-                {redirect, CoordNode} ->
-                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
-                            ["prepare", atom2list(CoordNode)]),
-                    try
-                        {UseAckP, Options2} = make_ack_options(
-                            [{ack_execute, self()} | Options]),
-                        Options3 = [{bad_coordinators, BadCoordinators} | Options2],
-                        {MiddleMan, CoordinatorTRef} =
-                            riak_kv_put_fsm_comm:start_remote_coordinator(
-                                CoordNode, [From,RObj,Options3],
-                                State#state.coordinator_timeout),
-                        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
-                                ["prepare", atom2list(CoordNode)]),
-                        ok = riak_kv_stat:update(coord_redir),
-                        maybe_await_remote_coordinator(UseAckP, MiddleMan,
-                                                       CoordNode, CoordinatorTRef, State)
-                    catch
-                        _:Reason ->
-                            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
-                                    ["prepare", dtrace_errstr(Reason)]),
-                            lager:error("Unable to forward put for ~p to ~p - ~p @ ~p\n",
-                                        [BKey, CoordNode, Reason, erlang:get_stacktrace()]),
-                            process_reply({error, {coord_handoff_failed, Reason}}, State)
-                    end;
-                {coordinator, CoordPLEntry, EffectivePreflist} ->
-                    maybe_trace_prepare(Trace, CoordPLEntry),
-                    StatTracked = get_option(stat_tracked, BucketProps, false),
-                    StartTime = riak_core_util:moment(),
-                    State1 = State#state{n              = N,
-                                         bucket_props   = EffectiveProps,
-                                         coord_pl_entry = CoordPLEntry,
-                                         preflist2      = EffectivePreflist,
-                                         starttime      = StartTime,
-                                         tracked_bucket = StatTracked},
-                    start_new_state(validate, State1)
-            end
+        {coordinator, _CoordPLEntry, _EffectivePreflist} = CoordinationOutcome->
+            process_coordination_outcome(CoordinationOutcome,
+                                         State#state{bucket_props = EffectiveProps,
+                                                     tracked_bucket = get_option(stat_tracked, BucketProps, false),
+                                                     n = N});
+        CoordinationOutcome ->
+            process_coordination_outcome(CoordinationOutcome, State)
     end.
 
+
+process_coordination_outcome(all_nodes_down,
+                             #state{trace = Trace} = State) ->
+    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1],
+            ["prepare", <<"all nodes down">>]),
+    process_reply({error, all_nodes_down}, State);
+process_coordination_outcome({redirect, CoordNode},
+                             #state{options = Options,
+                                    bad_coordinators = BadCoordinators,
+                                    from = From,
+                                    robj = RObj,
+                                    bkey = BKey,
+                                    coordinator_timeout = CoordinatorTimeout,
+                                    trace = Trace} = State) ->
+    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
+            ["prepare", atom2list(CoordNode)]),
+    try
+        {UseAckP, Options2} = make_ack_options(
+            [{ack_execute, self()} | Options]),
+        Options3 = [{bad_coordinators, BadCoordinators} | Options2],
+        {MiddleMan, CoordinatorTRef} =
+            riak_kv_put_fsm_comm:start_remote_coordinator(
+                CoordNode, [From, RObj, Options3],
+                CoordinatorTimeout),
+        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
+                ["prepare", atom2list(CoordNode)]),
+        ok = riak_kv_stat:update(coord_redir),
+        maybe_await_remote_coordinator(UseAckP, MiddleMan,
+                                       CoordNode, CoordinatorTRef, State)
+    catch
+        _:Reason ->
+            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
+                    ["prepare", dtrace_errstr(Reason)]),
+            lager:error("Unable to forward put for ~p to ~p - ~p @ ~p\n",
+                        [BKey, CoordNode, Reason, erlang:get_stacktrace()]),
+            process_reply({error, {coord_handoff_failed, Reason}}, State)
+    end;
+process_coordination_outcome({coordinator, CoordPLEntry, EffectivePreflist},
+                             #state{trace = Trace} = State) ->
+    maybe_trace_prepare(Trace, CoordPLEntry),
+    StartTime = riak_core_util:moment(),
+    State1 = State#state{coord_pl_entry = CoordPLEntry,
+                         preflist2 = EffectivePreflist,
+                         starttime = StartTime
+                         },
+    start_new_state(validate, State1).
+
+coordination_outcome(_Options, _DocIdx, {error, _}=Error, _BadCoordinators) ->
+    Error;
 coordination_outcome(Options, DocIdx, N, BadCoordinators) ->
     case get_effective_preflist(Options, DocIdx, N, BadCoordinators) of
         [] ->
