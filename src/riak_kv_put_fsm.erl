@@ -317,12 +317,13 @@ prepare({start, prepare}, State = #state{robj = RObj,
 maybe_ack(#state{options = Options}) ->
     %% If we are a forwarded coordinator, the originating node is expecting
     %% an ack from us.
-    case get_option(ack_execute, Options) of
-        undefined ->
-            ok;
-        Pid ->
-            executing_ack(Pid)
-    end.
+    AckPid = get_option(ack_execute, Options),
+    maybe_ack_to_pid(AckPid).
+
+maybe_ack_to_pid(undefined) ->
+    ok;
+maybe_ack_to_pid(AckPid) when is_pid(AckPid) ->
+    executing_ack(AckPid).
 
 process_coordination_outcome(all_nodes_down,
                              #state{trace = Trace} = State) ->
