@@ -19,8 +19,11 @@ start_remote_coordinator(CoordNode, Args, CoordinatorTimeout) ->
     %% of the spawn BIF will block.  The whole point of picking a new
     %% coordinator node is being able to pick a new coordinator node
     %% and try it ... without blocking for dozens of seconds.
+    RemoteRef = make_ref(),
+    FsmPid = self(),
     Pid = spawn(fun() ->
-                    proc_lib:spawn(CoordNode, riak_kv_put_fsm, start_link, Args)
+                    RemoteCoordinatorPid = proc_lib:spawn(CoordNode, riak_kv_put_fsm, start_link, Args),
+                    riak_kv_put_fsm:remote_coordinator_started(FsmPid, RemoteRef, RemoteCoordinatorPid)
                 end),
     TRef = erlang:start_timer(CoordinatorTimeout, self(), coordinator_timeout),
-    {Pid, TRef}.
+    {Pid, TRef, RemoteRef}.

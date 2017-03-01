@@ -8,17 +8,18 @@
 -include_lib("eqc/include/eqc.hrl").
 -include_lib("eqc/include/eqc_component.hrl").
 
--record(state, 
+-record(state,
         { fsm_pid,
           next_state = not_started,
           n_val,
           nodes,
           bad_coordinators,
           coordinating_node = none,
-          fake_fsm,
+          fake_fsm_pid,
           coordinator_tref,
-          coordinator_has_timed_out = false
-        }).
+          coordinator_has_timed_out = false,
+          remote_coordinator_ref,
+          remote_coord_start_ref}).
 
 
 -define(BUCKET_TYPE, <<"my_bucket_type">>).
@@ -96,12 +97,14 @@ start() ->
 
 stop(S) ->
     catch exit(S#state.fsm_pid, kill),
-    catch exit(S#state.fake_fsm, kill).
+    catch exit(S#state.fake_fsm_pid, kill).
 
 
 initial_state() ->
-    #state{fake_fsm = fake_fsm(),
-           coordinator_tref = make_ref()}.
+    #state{fake_fsm_pid = fake_fsm(),
+           coordinator_tref = make_ref(),
+           remote_coord_start_ref = make_ref(),
+           remote_coordinator_ref = make_ref()}.
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -249,7 +252,7 @@ start_prepare_callouts(S, _Args) ->
             ?MATCH({Options, _},
                    ?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
                             [CoordinatingNode, [?WILDCARD, ?WILDCARD, ?VAR], ?WILDCARD], 
-                            {S#state.fake_fsm, S#state.coordinator_tref})),
+                            {S#state.fake_fsm_pid, S#state.coordinator_tref, S#state.remote_coord_start_ref})),
             ?ASSERT(?MODULE, correct_options, [Options, S], 
                      {bad_coordinators_in_options, Options,
                       should_have_matched, S#state.bad_coordinators}),
@@ -295,10 +298,14 @@ start_prepare_next(S, _FakeFsmPid, _Args) ->
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-waiting_remote_coordinator(Pid, {executing_ack, Node}) ->
+waiting_remote_coordinator(Pid, {executing_ack, Node, RemoteStartRef, RemotePid}) ->
+    riak_kv_put_fsm:remote_coordinator_started(Pid, RemoteStartRef, RemotePid),
     Pid ! {ack, Node, now_executing};
 waiting_remote_coordinator(Pid, {coordinator_timeout, TRef}) ->
-    Pid ! {timeout, TRef, coordinator_timeout}.
+    Pid ! {timeout, TRef, coordinator_timeout};
+waiting_remote_coordinator(Pid, {coordinator_not_responsible, RemoteStartRef, RemotePid}) ->
+    riak_kv_put_fsm:remote_coordinator_started(Pid, RemoteStartRef, RemotePid),
+    Pid ! {'DOWN', make_ref(), process, RemotePid, not_responsible}.
 
 waiting_remote_coordinator_process(_,_) ->
     worker.
@@ -306,15 +313,18 @@ waiting_remote_coordinator_process(_,_) ->
 waiting_remote_coordinator_args(S) ->
     io:format("W"),
     elements([
-              [S#state.fsm_pid, {executing_ack, S#state.coordinating_node}],
+              [S#state.fsm_pid, {executing_ack, S#state.coordinating_node, S#state.remote_coord_start_ref, S#state.fake_fsm_pid}],
+              [S#state.fsm_pid, {coordinator_not_responsible, S#state.remote_coord_start_ref, S#state.fake_fsm_pid}],
               [S#state.fsm_pid, {coordinator_timeout, S#state.coordinator_tref}]
              ]).
 
 waiting_remote_coordinator_pre(S) ->
     S#state.next_state == waiting_remote_coordinator.
 
-waiting_remote_coordinator_callouts(_S, [_FsmPid, {executing_ack, _}]) ->
+waiting_remote_coordinator_callouts(_S, [_FsmPid, {executing_ack, _, _, _}]) ->
     ?CALLOUT(riak_kv_stat, update, [{fsm_exit, puts}], ok);
+waiting_remote_coordinator_callouts(_S, [_FsmPid, {coordinator_not_responsible, _, _}]) ->
+    ?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok);
 waiting_remote_coordinator_callouts(_S, [_FsmPid, {coordinator_timeout, _}]) ->
     ?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok).
                  
@@ -326,11 +336,15 @@ waiting_remote_coordinator_features(S, _Args, {ack, _, _}) ->
         true ->
             [remote_executes_after_timeout]
     end;
+waiting_remote_coordinator_features(_S, _Args, {'DOWN', _, process, _, not_responsible}) ->
+    [remote_not_responsible];
 waiting_remote_coordinator_features(_S, _Args, {timeout, _, coordinator_timeout}) ->
     [remote_timeout].
 
-waiting_remote_coordinator_next(S, _Res, [_FsmPid, {executing_ack, _}]) ->
+waiting_remote_coordinator_next(S, _Res, [_FsmPid, {executing_ack, _, _, _}]) ->
     S#state{next_state = done};
+waiting_remote_coordinator_next(S, _Res, [_FsmPid, {coordinator_not_responsible, _, _}]) ->
+    S#state{next_state = prepare};
 waiting_remote_coordinator_next(S, _Res, [_FsmPid, {coordinator_timeout, _}]) ->
     S#state{next_state = prepare,
             bad_coordinators = [S#state.coordinating_node | 
