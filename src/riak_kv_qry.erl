@@ -82,7 +82,12 @@ submit(#riak_sql_show_create_table_v1{}, ?DDL{table = Table} = DDL) ->
 submit(SQL = #riak_sql_insert_v1{}, _DDL) ->
     do_insert(SQL);
 submit(SQL = ?SQL_SELECT{}, DDL) ->
-    do_select(SQL, DDL);
+    {Elapsed, Result} = timer:tc(
+        fun() ->
+            do_select(SQL, DDL)
+        end),
+    riak_kv_stat:update({ts_queries, Elapsed}),
+    Result;
 submit(#riak_sql_show_tables_v1{}, _DDL) ->
     do_show_tables();
 submit(#riak_sql_explain_query_v1{'EXPLAIN' = Select}, DDL) ->

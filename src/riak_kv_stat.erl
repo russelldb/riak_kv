@@ -327,8 +327,17 @@ do_update({write_once_put, Microsecs, ObjSize}) ->
     P = ?PFX,
     ok = exometer:update([P, ?APP, write_once, puts], 1),
     ok = exometer:update([P, ?APP, write_once, puts, time], Microsecs),
-    create_or_update([P, ?APP, write_once, puts, objsize], ObjSize, histogram).
-
+    create_or_update([P, ?APP, write_once, puts, objsize], ObjSize, histogram);
+do_update({ts_queries, Microsecs}) ->
+    P = ?PFX,
+    ok = exometer:update([P, ?APP, ts_queries], 1),
+    ok = exometer:update([P, ?APP, ts_queries, time], Microsecs);
+do_update({ts_queries_queued, QueueSize}) ->
+    P = ?PFX,
+    ok = exometer:update([P, ?APP, ts_queries, queued], QueueSize);
+do_update(ts_queries_overload) ->
+    P = ?PFX,
+    ok = exometer:update([P, ?APP, ts_queries, overload], 1).
 
 %% private
 
@@ -781,7 +790,30 @@ stats() ->
 									   ring_ownership]},
       [], [{ring_members       , ring_members},
            {ring_num_partitions, ring_num_partitions},
-           {ring_ownership     , ring_ownership}]}
+           {ring_ownership     , ring_ownership}]},
+
+
+
+     %%
+     %% TIME SERIES STATS
+     %%
+
+     {[ts_queries], spiral, [], 
+        [{one, node_ts_queries},
+         {count, node_ts_queries_total}]},
+     {[ts_queries, time], histogram, [],
+        [{mean  , node_ts_queries_time_mean},
+         {median, node_ts_queries_time_median},
+         {95    , node_ts_queries_time_95},
+         {99    , node_ts_queries_time_99},
+         {max   , node_ts_queries_time_100}]},
+     {[ts_queries, queued], histogram, [],
+        [{median, node_ts_queries_queued_median},
+         {max   , node_ts_queries_queued_100}]},
+     {[ts_queries, overload], spiral, [], 
+        [{one,   node_ts_queries_overload},
+         {count, node_ts_queries_overload_total}]}
+
      | read_repair_aggr_stats(Pfx)] ++ bc_stats(Pfx).
 
 read_repair_aggr_stats(Pfx) ->

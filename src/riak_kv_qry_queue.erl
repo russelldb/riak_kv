@@ -163,8 +163,10 @@ do_push_query(QueryItem,
         {empty, WaitingWorkers2} ->
             % there are no awaiting workers so try and queue the query if
             % there is space
+            QueueLen = queue:len(Queue1),
             case queue:len(Queue1) >= MaxQLen of
                 true  ->
+                    riak_kv_stat:update(ts_queries_overload),
                     % no space, return overload
                     {reply, {error, overload}, State1};
                 false ->
@@ -172,6 +174,8 @@ do_push_query(QueryItem,
                     State2 =
                         State1#state{ queued_qrys = queue:in(QueryItem, Queue1),
                                       waiting_workers = WaitingWorkers2 },
+
+                    riak_kv_stat:update({ts_queries_queued, QueueLen+1}),
                     {reply, ok, State2}
             end;
         {{value, Worker}, WaitingWorkers2} ->
