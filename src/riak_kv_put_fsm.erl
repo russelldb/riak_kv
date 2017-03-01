@@ -30,21 +30,40 @@
 
 -behaviour(gen_fsm).
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
--export([start/3, start/6,start/7]).
--export([start_link/3,start_link/6,start_link/7]).
--export([set_put_coordinator_failure_timeout/1,
-         get_put_coordinator_failure_timeout/0]).
 -ifdef(TEST).
 -export([test_link/4]).
 -endif.
--export([init/1, handle_event/3, handle_sync_event/4,
-         handle_info/3, terminate/3, code_change/4]).
--export([prepare/2, validate/2, precommit/2,
+
+%% gen_fsm functions
+-export([init/1,
+         handle_event/3,
+         handle_sync_event/4,
+         handle_info/3,
+         terminate/3,
+         code_change/4]).
+
+%% start interfaces
+-export([start/3,
+         start/6,
+         start/7,
+         start_link/3,
+         start_link/6,
+         start_link/7]).
+
+%% state functions
+-export([prepare/2,
+         validate/2,
+         precommit/2,
          waiting_local_vnode/2,
          waiting_remote_vnode/2,
-         postcommit/2, finish/2]).
+         postcommit/2,
+         finish/2]).
 
--export([executing_ack/1]).
+%% API
+-export([set_put_coordinator_failure_timeout/1,
+         get_put_coordinator_failure_timeout/0,
+         executing_ack/1,
+         remote_coordinator_started/3]).
 
 -type detail_info() :: timing.
 -type detail() :: true |
@@ -106,11 +125,13 @@
                 timing = [] :: [{atom(), {non_neg_integer(), non_neg_integer(),
                                           non_neg_integer()}}],
                 reply, % reply sent to client,
-                trace = false :: boolean(), 
+                trace = false :: boolean(),
                 tracked_bucket=false :: boolean(), %% track per bucket stats
                 bad_coordinators = [] :: [atom()],
                 coordinator_timeout :: integer(),
                 middleman :: pid(),
+                remote_coord_start_ref :: reference(),
+                remote_coordinator_pid :: pid(),
                 coordinating_node :: node(),
                 coordinator_tref :: reference()
                }).
@@ -191,15 +212,17 @@ make_ack_options(Options) ->
 executing_ack(Pid) ->
     Pid ! {ack, node(), now_executing}.
 
-
+remote_coordinator_started(FsmPid, RemoteRef, RemotePid) ->
+    gen_fsm:send_all_state_event(FsmPid, {remote_coordinator_started, RemoteRef, RemotePid}).
 
 %% @doc Note that the state waiting_remote_coordinator only expects messages sent to it using erlang:send/2.
 %%      So there is no implementation of event handling for that state.
-maybe_await_remote_coordinator(false = _UseAckP, _MiddleMan, _CoordNode, CoordinatorTRef, StateData) ->
+maybe_await_remote_coordinator(false = _UseAckP, _MiddleMan, _CoordNode, CoordinatorTRef, _RemoteStartRef, StateData) ->
     erlang:cancel_timer(CoordinatorTRef),
     {stop, normal, StateData};
-maybe_await_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, CoordinatorTRef, StateData) ->
-    new_state(waiting_remote_coordinator, StateData#state{middleman = MiddleMan,
+maybe_await_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, CoordinatorTRef, RemoteStartRef, StateData) ->
+    new_state(waiting_remote_coordinator, StateData#state{remote_coord_start_ref = RemoteStartRef,
+                                                          middleman = MiddleMan,
                                                           coordinating_node = CoordNode,
                                                           coordinator_tref = CoordinatorTRef}).
 
@@ -299,12 +322,13 @@ prepare({start, prepare}, State = #state{robj = RObj,
         %% `process_reply' so we don't overload what `process_reply' means?
         {error, _} = Error ->
             process_reply(Error, State);
-        redirect_ignored ->
-            %% TODO: in future version of Riak, add a `nack_execute' message
-            %% rather than just stopping - will allow us to communicate our unwillingness
-            %% to coordinate back to the calling process rather than making it time out
-            %% will need a new capability in order to support mixed clusters
-            {stop, normal, State};
+        not_responsible ->
+            %% In a mixed cluster, older versions of riak will simply timeout
+            %% waiting for the `ack', but by stopping with a `not_responsible' reason
+            %% we can signal to newer code that we don't think we own any of the partitions
+            %% to which this put should be directed. This eliminates the need for a
+            %% `nack' message/capability
+            {stop, not_responsible, State};
         {coordinator, _CoordPLEntry, _EffectivePreflist} = CoordinationOutcome->
             process_coordination_outcome(CoordinationOutcome,
                                          State#state{bucket_props = EffectiveProps,
@@ -345,7 +369,7 @@ process_coordination_outcome({redirect, CoordNode},
         {UseAckP, Options2} = make_ack_options(
             [{ack_execute, self()} | Options]),
         Options3 = [{bad_coordinators, BadCoordinators} | Options2],
-        {MiddleMan, CoordinatorTRef} =
+        {MiddleMan, CoordinatorTRef, RemoteStartRef} =
             riak_kv_put_fsm_comm:start_remote_coordinator(
                 CoordNode, [From, RObj, Options3],
                 CoordinatorTimeout),
@@ -353,7 +377,8 @@ process_coordination_outcome({redirect, CoordNode},
                 ["prepare", atom2list(CoordNode)]),
         ok = riak_kv_stat:update(coord_redir),
         maybe_await_remote_coordinator(UseAckP, MiddleMan,
-                                       CoordNode, CoordinatorTRef, State)
+                                       CoordNode, CoordinatorTRef,
+                                       RemoteStartRef, State)
     catch
         _:Reason ->
             ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
@@ -394,7 +419,7 @@ coordinator_selection(true = _IsRedirect, _ShouldUpdateVclock, [] = _LocalPL, _E
     %% We don't want to redirect again here, but we should force a ring broadcast
     %% to try to get the original node and this node to agree on ownership.
     riak_core_ring_manager:force_update(),
-    redirect_ignored;
+    not_responsible;
 coordinator_selection(_IsRedirect, true = _ShouldUpdateVclock, [] = _LocalPL, EffectivePreflist) ->
     % this node is not in the preflist, foward to random node
     CoordinatingNode = get_random_coordinating_node(EffectivePreflist),
@@ -808,6 +833,17 @@ finish(Reply, StateData = #state{putcore = PutCore,
 
 
 %% @private
+handle_event({remote_coordinator_started, RemoteStartRef, RemotePid}, waiting_remote_coordinator,
+             #state{remote_coord_start_ref = RemoteStartRef} = StateData) ->
+    _ = monitor(process, RemotePid),
+    NewState = StateData#state{remote_coordinator_pid = RemotePid, remote_coord_start_ref = undefined},
+    {next_state, waiting_remote_coordinator, NewState};
+handle_event({remote_coordinator_started, _RemoteRef, _RemotePid}, StateName, StateData) ->
+    %% Late remote coordinator started message - ignore
+    %% NOTE: we _could_ try to kill this Pid, but the delay in receiving the response
+    %% indicates that we're not in a healthy state to begin with, so attempting to kill
+    %% this remote coordinator is most likely futile anyway.
+    {next_state, StateName, StateData};
 handle_event(_Event, _StateName, StateData) ->
     {stop,badmsg,StateData}.
 
@@ -831,6 +867,22 @@ handle_info({timeout, TRef, coordinator_timeout}, waiting_remote_coordinator,
                                              coordinator_tref = undefined});
 handle_info({timeout, _TRef, coordinator_timeout}, StateName, StateData) ->
     % This is a late coordinator_timeout - just ignore.
+    {next_state, StateName, StateData};
+handle_info({'DOWN', _RemoteCoordinatorRef, process, RemoteCoordinatorPid, not_responsible}, waiting_remote_coordinator,
+            #state{remote_coordinator_pid = RemoteCoordinatorPid, coordinating_node = CoordinatingNode} = StateData) ->
+    lager:info("Attempted to redirect to a node that is not responsible: ~p", [CoordinatingNode]),
+    %% in `coordinator_selection' we attempted to force a ring update to try to synchronize
+    %% the view of the ring across the cluster. In the future, it may be better to try to
+    %% synchronously force the ring update, but that may not be feasible in larger clusters.
+    %% It is more likely that the target node knows something true that we do not know, so
+    %% add it to the list of bad coordinators so we don't end up in a redirect loop.
+    %% This means we _may_ end up in a state where a request fails when it could have possibly
+    %% succeeded, but that's better than us constantly retrying to the same node and failing.
+    NewBad = [StateData#state.coordinating_node | StateData#state.bad_coordinators],
+    start_new_state(prepare, StateData#state{bad_coordinators = NewBad,
+                                             coordinator_tref = undefined});
+handle_info({'DOWN', _Process, process, _Object, _Info}, StateName, StateData) ->
+    % This is a late DOWN from a middle man - ignore
     {next_state, StateName, StateData};
 handle_info({ack, Node, now_executing}, StateName, StateData) ->
     late_put_fsm_coordinator_ack(Node),
