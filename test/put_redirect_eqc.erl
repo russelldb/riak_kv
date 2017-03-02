@@ -32,9 +32,6 @@
         ?CALLOUT(app_helper, get_env, Args,
                  erlang:apply(?MODULE, app_get_env, Args))).
 
--define(LAGER_ERROR,
-        ?CALLOUT(lager, error, [?WILDCARD, ?WILDCARD], ok)).
-
 -define(KV_STAT_CALLOUT,
         ?CALLOUT(riak_kv_stat, update, [?WILDCARD], ok)).
 
@@ -109,7 +106,8 @@ initial_state() ->
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%% Mocking
-
+%% Don't mock lager, just start it if you need to. It does not require anything
+%% special and will work inside EQC.
 api_spec() ->
     #api_spec{
        language = erlang,
@@ -154,10 +152,6 @@ api_spec() ->
                    #api_module{
                       name = riak_kv_util_mock,
                       functions = [ #api_fun{ name = get_random_element, arity=1}
-                                  ]},
-                   #api_module{
-                      name = lager,
-                      functions = [ #api_fun{ name = error, arity=2 } 
                                   ]}
                   ]}.
                                               
