@@ -162,6 +162,8 @@ api_spec() ->
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% starts the fsm and covers running through the init part and then going to the
+%%% prepare state.
 start_put(From, Object, PutOptions, _Nodes) ->
     {ok, Pid} = riak_kv_put_fsm:start_link(From, Object, PutOptions),
     unlink(Pid),
@@ -197,6 +199,14 @@ start_put_next(S, Pid, [_From, _Object, PutOptions, Nodes]) ->
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% This is where the big decisions are being taken in the fsm.
+%%% NOTE: this only covers {sloppy_quorum, true}.
+%%% This test branches out between the local node being the coordinator or having to
+%%% redirect the put to another node. Hence the case statement in
+%%% start_prepare_callouts/2.
+%%% When redirecting we specifically check that the bad_coordinators information is
+%%% passed along to the other node, so that it has full information about the view on
+%%% the system.
 start_prepare(Pid) ->
     gen_fsm:send_event(Pid, {start, prepare}).
 
@@ -231,7 +241,7 @@ start_prepare_callouts(S, _Args) ->
     ?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, ?WILDCARD, ?WILDCARD],
                        APL),
     % @todo: take into account if we use
-    % sloppy_quorum (true is default)
+    % sloppy_quorum (true is default)2
     case should_node_coordinate(S) of
         true ->
             io:format("*"),
@@ -291,6 +301,16 @@ start_prepare_next(S, _FakeFsmPid, _Args) ->
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% This is relevant if a redirect has been initiated.
+%%% There are three possible outcomes:
+%%%   1. The remote nodes takes over and sends us an ack.
+%%%   2. We time out before getting a result back from the remote node. 
+%%%      This means going back to the prepare state, but with the remote note added
+%%%      to the list of bad_coordinators.
+%%%   3. The remote node does not think it is responsible for the key. 
+%%%      This can happen when changes to the ring have not fully propagated in the
+%%%      system. In this case we consider the chosen remote node to be bad and cycle
+%%%      back to the prepare state with this information. 
 waiting_remote_coordinator(Pid, {executing_ack, Node, RemoteStartRef, RemotePid}) ->
     riak_kv_put_fsm:remote_coordinator_started(Pid, RemoteStartRef, RemotePid),
     Pid ! {ack, Node, now_executing};
@@ -346,6 +366,12 @@ waiting_remote_coordinator_next(S, _Res, [_FsmPid, {coordinator_timeout, _}]) ->
                                 S#state.bad_coordinators],
             coordinator_has_timed_out = true}.
 
+
+%%% NOTE:
+%%% start_validate and start_precommit are currently not being used in the test as we
+%%% stop once we have validated that the redirect behaviour is correct.
+%%% Once we find the time to expand this to cover more of the put fsm behaviour we
+%%% can expand on this approach.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start_validate(Pid) ->
