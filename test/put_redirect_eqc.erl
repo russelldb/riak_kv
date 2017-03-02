@@ -269,6 +269,7 @@ calc_apl_arguments(S) ->
     APL = active_preflist(sloppy_quorum, S),
     APLChoice = lists:last(APL),
     {{_, CoordinatingNode}, _} = APLChoice,
+    io:format("coordinating node: ~p~n", [CoordinatingNode]),
     {APL, APLChoice, CoordinatingNode}.
 
 
@@ -344,7 +345,9 @@ waiting_remote_coordinator_features(_S, _Args, {timeout, _, coordinator_timeout}
 waiting_remote_coordinator_next(S, _Res, [_FsmPid, {executing_ack, _, _, _}]) ->
     S#state{next_state = done};
 waiting_remote_coordinator_next(S, _Res, [_FsmPid, {coordinator_not_responsible, _, _}]) ->
-    S#state{next_state = prepare};
+    S#state{next_state = prepare,
+            bad_coordinators = [S#state.coordinating_node | 
+                                S#state.bad_coordinators]};
 waiting_remote_coordinator_next(S, _Res, [_FsmPid, {coordinator_timeout, _}]) ->
     S#state{next_state = prepare,
             bad_coordinators = [S#state.coordinating_node | 
