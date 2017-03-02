@@ -114,10 +114,11 @@ api_spec() ->
     #api_spec{
        language = erlang,
        modules  = [
+                   % We don't care about calls to app_helper and they are static, so
+                   % we place them in a separate module.
                    #api_module{
-                      name = app_helper,
-                      functions = [ #api_fun{ name = get_env, arity = 2},
-                                    #api_fun{ name = get_env, arity = 3} ]},
+                      name = app_helper, fallback = app_helper_mock,
+                      functions = [] },
                    #api_module{
                       name = riak_kv_stat,
                       functions = [ #api_fun{ name = update, arity = 1} ]},
@@ -183,8 +184,6 @@ start_put_pre(S) ->
 %% @todo: mock riak_kv_get_put_monitor and avoid the parallelism with the
 %% KV_STAT_CALLOUT that it causes.
 start_put_callouts(_S, _Args) ->
-    ?APP_HELPER_CALLOUT([riak_kv, put_coordinator_failure_timeout, 3000]),
-    ?APP_HELPER_CALLOUT([riak_kv, fsm_trace_enabled]),
     ?PAR([
           ?KV_STAT_CALLOUT
          ,?CALLOUT(riak_kv_put_fsm_comm, start_state, [prepare], ok)]).
@@ -230,9 +229,9 @@ start_prepare_pre(S) ->
 start_prepare_callouts(S, _Args) ->
     io:format("#"),
     {APL, APLChoice, CoordinatingNode} = calc_apl_arguments(S),
-    ?APP_HELPER_CALLOUT([riak_core, default_bucket_props]),
+%    ?APP_HELPER_CALLOUT([riak_core, default_bucket_props]),
     ?CALLOUT(riak_core_bucket, get_bucket, [?WILDCARD], 
-             (app_get_env(riak_core, default_bucket_props))),
+             (app_helper_mock:get_env(riak_core, default_bucket_props))),
     ?CALLOUT(riak_core_node_watcher, nodes, [riak_kv],
              (S#state.nodes)),
     ?CALLOUT(riak_core_apl,get_apl_ann, [?WILDCARD, ?WILDCARD, ?WILDCARD],
@@ -248,7 +247,7 @@ start_prepare_callouts(S, _Args) ->
             ?CALLOUT(riak_kv_util_mock, get_random_element, [?WILDCARD], 
                      APLChoice),
             ?CALLOUT(riak_core_capability, get, [?WILDCARD, ?WILDCARD], enabled),
-            ?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true]),
+%            ?APP_HELPER_CALLOUT([riak_kv, retry_put_coordinator_failure, true]),
             ?MATCH({Options, _},
                    ?CALLOUT(riak_kv_put_fsm_comm, start_remote_coordinator, 
                             [CoordinatingNode, [?WILDCARD, ?WILDCARD, ?VAR], ?WILDCARD], 
@@ -269,7 +268,6 @@ calc_apl_arguments(S) ->
     APL = active_preflist(sloppy_quorum, S),
     APLChoice = lists:last(APL),
     {{_, CoordinatingNode}, _} = APLChoice,
-    io:format("coordinating node: ~p~n", [CoordinatingNode]),
     {APL, APLChoice, CoordinatingNode}.
 
 
@@ -419,24 +417,6 @@ bad_coordinators() ->
               [],
               [node_c]
              ]).
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%% Mocking functions
-
-app_get_env(riak_kv, fsm_trace_enabled) ->
-    false;
-app_get_env(riak_core, default_bucket_props) ->
-    [{chash_keyfun, {riak_core_util, chash_std_keyfun}},
-     {pw, 0},
-     {w, quorum},
-     {dw, quorum}].
-
-
-app_get_env(riak_kv, put_coordinator_failure_timeout, 3000) ->
-    3000;
-app_get_env(riak_kv, retry_put_coordinator_failure, true) ->
-    true.
-
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Helper functions
