@@ -4,9 +4,11 @@
 -module(put_redirect_eqc).
 
 -compile(export_all).
+-ifdef(EQC).
 
 -include_lib("eqc/include/eqc.hrl").
 -include_lib("eqc/include/eqc_component.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -record(state,
         { fsm_pid,
@@ -38,6 +40,18 @@
 -define(START_STATE(State), 
         ?CALLOUT(riak_kv_put_fsm_comm, start_state, [State], ok)).
 
+-define(QC_OUT(P),
+    eqc:on_output(fun(Str, Args) -> io:format(user, Str, Args) end, P)).
+
+
+
+eqc_test_() ->
+    {spawn,
+     [
+        {timeout, 70,
+         ?_assertEqual(true, eqc:quickcheck(?QC_OUT(prop_redirect())))}
+       ]
+    }.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 prop_redirect() ->
@@ -490,3 +504,5 @@ fake_loop() ->
         _M ->
             fake_loop()
     end.
+
+-endif. % EQC
