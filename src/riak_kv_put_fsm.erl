@@ -439,7 +439,7 @@ get_local_coordinating_preflist_entry(false, _LocalPL) ->
 
 maybe_trace_prepare(true, CoordPLEntry) ->
     CoordPlNode = get_coordinating_node_from_preflist_entry(CoordPLEntry),
-    ?DTRACE(true, ?C_PUT_FSM_PREPARE, [0], ["prepare", CoordPlNode]);
+    ?DTRACE(?C_PUT_FSM_PREPARE, [0], ["prepare", CoordPlNode]);
 maybe_trace_prepare(false, _CoordPLEntry) ->
     ok.
 
