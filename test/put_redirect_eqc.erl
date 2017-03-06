@@ -1,5 +1,5 @@
 %% @note Remember to compile riak_kv_util like this:
-%% ERL_LIBS=deps erlc -I include  +debug_info src/riak_kv_util.erl -o ebin 
+%% ERL_LIBS=deps erlc -I include  +debug_info -o ebin src/riak_kv_util.erl 
 
 -module(put_redirect_eqc).
 
