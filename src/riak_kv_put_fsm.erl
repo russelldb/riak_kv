@@ -437,10 +437,10 @@ get_local_coordinating_preflist_entry(true, LocalPL) ->
 get_local_coordinating_preflist_entry(false, _LocalPL) ->
     undefined.
 
-maybe_trace_prepare(true, CoordPLEntry) ->
+maybe_trace_prepare(true=_Trace, CoordPLEntry) ->
     CoordPlNode = get_coordinating_node_from_preflist_entry(CoordPLEntry),
     ?DTRACE(?C_PUT_FSM_PREPARE, [0], ["prepare", CoordPlNode]);
-maybe_trace_prepare(false, _CoordPLEntry) ->
+maybe_trace_prepare(false=_Trace, _CoordPLEntry) ->
     ok.
 
 get_coordinating_node_from_preflist_entry(CoordPLEntry) ->
