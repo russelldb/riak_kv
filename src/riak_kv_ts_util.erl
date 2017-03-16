@@ -28,6 +28,7 @@
          apply_timeseries_bucket_props/3,
          build_sql_record/3,
          check_table_feature_supported/2,
+         is_table_active_and_supported/2,
          is_table_supported/2,
          encode_typeval_key/1,
          explain_query/1, explain_query/2,
@@ -54,6 +55,7 @@
 -compile(export_all).
 -endif.
 
+-define(METADATA_PREFIX, {core, buckets}).
 -define(TABLE_ACTIVATE_WAIT, 30). %%<< make TABLE_ACTIVATE_WAIT configurable in tsqueryreq
 
 %% NOTE on table_to_bucket/1: Clients will work with table
@@ -318,10 +320,32 @@ queried_table(#riak_sql_show_create_table_v1{'SHOW_CREATE_TABLE' = Table}) ->
 %% Check that Table is in good standing and ready for TS operations
 %% (its bucket type has been activated and it has a DDL in its props)
 get_table_ddl(Table) when is_binary(Table) ->
-    case riak_core_bucket:get_bucket(table_to_bucket(Table)) of
+    Bucket = table_to_bucket(Table),
+    case riak_core_bucket:get_bucket(Bucket) of
         {error, _} = Error ->
             Error;
         [_|_] ->
+            Active = riak_core_metadata:get(?METADATA_PREFIX, Bucket),
+            lager:info("Metadata = ~p", [Active]),
+            verify_table_active(Table, Active)
+    end.
+-else.
+get_table_ddl(_Table) ->
+    {ok, module, ?DDL{}}.
+-endif.
+
+%%
+verify_table_active(_Table, undefined) ->
+    {error, table_not_active};
+verify_table_active(_Table, {error, _} = Error) ->
+    Error;
+verify_table_active(Table, Active) ->
+    case proplists:get_value(active, Active) of
+        undefined ->
+            {error, table_not_active};
+        false ->
+            {error, table_not_active};
+        _ ->
             Mod = riak_ql_ddl:make_module_name(Table),
             case catch Mod:get_ddl() of
                 {_, {undef, _}} ->
@@ -330,10 +354,6 @@ get_table_ddl(Table) when is_binary(Table) ->
                     {ok, Mod, DDL}
             end
     end.
--else.
-get_table_ddl(_Table) ->
-    {ok, module, ?DDL{}}.
--endif.
 
 
 %%

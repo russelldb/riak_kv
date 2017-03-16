@@ -189,7 +189,7 @@ wait_until_supported1(Nodes, SvcMod, Table, DDL, DDLRecCap, Milliseconds, WaitMi
 
 get_remote_is_table_active_and_supported(Nodes, Table, DDLRecCap) ->
     multi_is_all_true(
-      rpc:multicall(Nodes, riak_kv_ts_util, is_table_supported,
+      rpc:multicall(Nodes, riak_kv_ts_util, is_table_active_and_supported,
                     [DDLRecCap, Table])).
 
 multi_is_all_true({_Results, BadNodes}) when BadNodes =/= [] ->
