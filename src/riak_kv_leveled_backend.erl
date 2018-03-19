@@ -106,6 +106,7 @@ start(Partition, Config) ->
     CLH = app_helper:get_prop_or_env(compaction_low_hour, Config, leveled),
     CTH = app_helper:get_prop_or_env(compaction_top_hour, Config, leveled),
     MRL = app_helper:get_prop_or_env(max_run_length, Config, leveled),
+
     case get_data_dir(DataRoot, integer_to_list(Partition)) of
         {ok, DataDir} ->
             StartOpts = [{root_path, DataDir},
