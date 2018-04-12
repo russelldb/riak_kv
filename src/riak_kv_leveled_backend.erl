@@ -87,7 +87,7 @@ capabilities(_, _) ->
 -spec start(integer(), list()) -> {ok, state()} | {error, term()}.
 start(Partition, Config) ->
     %% Get the data root directory - cuttlefish not working
-    DataRoot = ?LEVELED_DATAROOT,
+    DataRoot = app_help:get_prop_or_env(data_root, Config, leveled, ?LEVELED_DATAROOT),
     case get_data_dir(DataRoot, integer_to_list(Partition)) of
         {ok, DataDir} ->
             StartOpts = [{root_path, DataDir},
