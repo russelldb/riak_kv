@@ -74,7 +74,7 @@ ver({tag,T}) ->
    io_lib:format("tag:~s", [T]);
 ver({branch, B} ) ->
    io_lib:format("branch:~s", [B]);
-ver(R) -> 
+ver(R) ->
    io_lib:format("ref:~s", [R]).
 
 %% Read a rebar file. Find any `deps' option. Accumulate tuples of the
@@ -87,8 +87,7 @@ map_rebar(BaseDir, Path, Acc) ->
             lists:foldl(
               fun({DepName, _, {_,_,V}  }, A) ->
                       From = app_name(Path),
-                      VerStr = ver(V),
-                      To = {atom_to_list(DepName), VerStr},
+                      To = {atom_to_list(DepName), V},
                       case ordsets:is_element({To, From}, A) of
                           true ->
                               %% we've already seen the other side,
@@ -121,4 +120,16 @@ file_end() ->
     io:format(standard_io, "}~n", []).
 
 file_edge(From, {To,V} ) ->
-    io:format(standard_io, " \"~s\" -> ~s [ label=\"~s\" ];~n", [From, To,V]).
+    set_node(To, V),
+    VerStr = ver(V),
+    io:format(standard_io, " \"~s\" -> ~s [ label=\"~s\" ];~n", [From, To,VerStr]).
+
+set_node(To, {tag, _}) ->
+    color_node(To, "white");
+set_node(To, {branch, _}) ->
+    color_node(To, "red");
+set_node(To, _Ref) ->
+    color_node(To, "green").
+
+color_node(To, Colour) ->
+    io:format(standard_io, "~s [color=\"black\", style=\"filled,solid\", fillcolor=\"~s\"];", [To, Colour]).
