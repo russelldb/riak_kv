@@ -297,6 +297,115 @@ prepare(timeout, State = #state{robj = RObj, options=Options}) ->
     N = get_n_val(Options, BucketProps),
     get_preflist(N, State#state{tracked_bucket=StatTracked, bucket_props=BucketProps}).
 
+prepare(timeout, StateData0 = #state{from = From, robj = RObj,
+                                     bkey = BKey = {Bucket, _Key},
+                                     options = Options,
+                                     trace = Trace,
+                                     bad_coordinators = BadCoordinators}) ->
+    {ok, DefaultProps} = application:get_env(riak_core, 
+                                             default_bucket_props),
+    BucketProps = riak_core_bucket:get_bucket(riak_object:bucket(RObj)),
+    %% typed buckets never fall back to defaults
+    Props = 
+        case is_tuple(Bucket) of
+            false -> 
+                lists:keymerge(1, lists:keysort(1, BucketProps), 
+                               lists:keysort(1, DefaultProps));
+            true ->
+                BucketProps
+        end,
+    DocIdx = riak_core_util:chash_key(BKey, BucketProps),
+    Bucket_N = get_option(n_val, BucketProps),
+    N = case get_option(n_val, Options, false) of
+            false ->
+                Bucket_N;
+            N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
+                %% don't allow custom N to exceed bucket N
+                N_val;
+            Bad_N ->
+                {error, {n_val_violation, Bad_N}}
+        end,
+    case N of
+        {error, _} = Error ->
+            process_reply(Error, StateData0);
+        _ ->
+            StatTracked = get_option(stat_tracked, BucketProps, false),
+            Preflist2 = 
+                case get_option(sloppy_quorum, Options, true) of
+                    true ->
+                        UpNodes = riak_core_node_watcher:nodes(riak_kv),
+                        riak_core_apl:get_apl_ann(DocIdx, N, 
+                                                  UpNodes -- BadCoordinators);
+                    false ->
+                        Preflist1 =
+                            riak_core_apl:get_primary_apl(DocIdx, N, riak_kv),
+                        [X || X = {{_Index, Node}, _Type} <- Preflist1,
+                              not lists:member(Node, BadCoordinators)]
+                end,
+
+            %% NOTE: ends here if preflist2 is empty
+            if Preflist2 =:= [] ->
+                    %% Empty preflist
+                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1],
+                            ["prepare",<<"all nodes down">>]),
+                    process_reply({error, all_nodes_down}, StateData0);
+               true ->
+                    continue
+            end,
+
+            CoordinatorType = get_coordinator_type(Options),
+            %% Check if this node is in the preference list so it can coordinate
+            LocalPL = [IndexNode || {{_Index, Node} = IndexNode, _Type} <- Preflist2,
+                                    Node == node()],
+
+
+            case select_coordinator(LocalPL, CoordinatorType) of
+                forward ->
+                    %% This node is not in the preference list
+                    %% forward on to a random node
+                    {ListPos, _} = random:uniform_s(length(Preflist2), os:timestamp()),
+                    {{_Idx, CoordNode},_Type} = lists:nth(ListPos, Preflist2),
+                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
+                            ["prepare", atom2list(CoordNode)]),
+                    try
+                        {UseAckP, Options2} = make_ack_options(
+                                                [{ack_execute, self()}|Options]),
+                        MiddleMan = spawn_coordinator_proc(
+                                      CoordNode, riak_kv_put_fsm, start_link,
+                                      [From,RObj,Options2]),
+                        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
+                                ["prepare", atom2list(CoordNode)]),
+                        ok = riak_kv_stat:update(coord_redir),
+                        monitor_remote_coordinator(UseAckP, MiddleMan,
+                                                   CoordNode, StateData0)
+                    catch
+                        _:Reason ->
+                            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
+                                    ["prepare", dtrace_errstr(Reason)]),
+                            lager:error("Unable to forward put for ~p to ~p - ~p @ ~p\n",
+                                        [BKey, CoordNode, Reason, erlang:get_stacktrace()]),
+                            process_reply({error, {coord_handoff_failed, Reason}}, StateData0)
+                    end;
+                {continue, CoordPLEntry} ->
+                    CoordPlNode = case CoordPLEntry of
+                                      undefined  -> undefined;
+                                      {_Idx, Nd} -> atom2list(Nd)
+                                  end,
+                    %% This node is in the preference list, continue
+                    StartTime = riak_core_util:moment(),
+                    StateData = StateData0#state{n = N,
+                                                 bucket_props = Props,
+                                                 coord_pl_entry = CoordPLEntry,
+                                                 preflist2 = Preflist2,
+                                                 starttime = StartTime,
+                                                 tracked_bucket = StatTracked},
+                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
+                            ["prepare", CoordPlNode]),
+                    new_state_timeout(validate, StateData)
+            end
+    end.
+>>>>>>> WIP: put fsm mailbox check
+
 %% @private
 validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
                                       options = Options0,
