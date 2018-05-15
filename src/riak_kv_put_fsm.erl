@@ -1041,7 +1041,6 @@ select_coordinator(_Preflist, any=_CoordinatorType, _MBoxCheck) ->
     %% no coordinator, no mailbox queues to route around
     {local, undefined}.
 
-
 %% @private decide if the coordinator has to be a local, causality
 %% advancing vnode, or just any/all at once
 -spec get_coordinator_type(options()) -> any | local.
