@@ -1009,6 +1009,7 @@ coordinate_or_forward(Preflist, State) ->
 
 %% @private selects a coordinating vnode for the put, depending on
 %% locality, mailbox length, etc.
+
 -spec select_coordinator(riak_core_apl:preflist_ann(), local | any, boolean()) ->
                                 {local, riak_kv_fsm_common:preflist_entry()} |
                                 {local, undefined} |
