@@ -94,6 +94,13 @@
 
 -type options() :: [option()].
 
+-type preflist_entry() :: {Idx::non_neg_integer(), node()}.
+%% the information about vnode mailbox queues used to select a
+%% coordinator
+-type mbox_data() :: [{preflist_entry(),
+                       MBoxSize::error | non_neg_integer(),
+                       MBoxSofLimit:: error | non_neg_integer()}] | [].
+
 -export_type([option/0, options/0, detail/0, detail_info/0]).
 
 -record(state, {from :: {raw, integer(), pid()},
@@ -1009,7 +1016,6 @@ coordinate_or_forward(Preflist, State) ->
 
 %% @private selects a coordinating vnode for the put, depending on
 %% locality, mailbox length, etc.
-
 -spec select_coordinator(riak_core_apl:preflist_ann(), local | any, boolean()) ->
                                 {local, riak_kv_fsm_common:preflist_entry()} |
                                 {local, undefined} |
