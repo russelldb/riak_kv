@@ -22,6 +22,13 @@
 
 -module(riak_kv_get_fsm).
 -behaviour(gen_fsm).
+
+-import(riak_kv_fsm_common, [get_option/2, get_option/3,
+                             get_bucket_props/1,
+                             get_n_val/2,
+                             get_preflist/5,
+                             partition_local_remote/1]).
+
 -include_lib("riak_kv_vnode.hrl").
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -43,24 +50,32 @@
 -type option() :: {r, pos_integer()} |         %% Minimum number of successful responses
                   {pr, non_neg_integer()} |    %% Minimum number of primary vnodes participating
                   {basic_quorum, boolean()} |  %% Whether to use basic quorum (return early
-                                               %% in some failure cases.
+                  %% in some failure cases.
                   {notfound_ok, boolean()}  |  %% Count notfound reponses as successful.
                   {force_aae, boolean()}    |  %% Force there to be be an AAE exchange for the
-                                               %% preflist after the GEt has been completed 
+                  %% preflist after the GEt has been completed 
                   {timeout, pos_integer() | infinity} | %% Timeout for vnode responses
                   {details, details()} |       %% Return extra details as a 3rd element
                   {details, true} |
                   details |
                   {sloppy_quorum, boolean()} | %% default = true
                   {n_val, pos_integer()} |     %% default = bucket props
-                  {crdt_op, true | undefined}. %% default = undefined
+                  {crdt_op, true | undefined} | %% default = undefined
+                  {coordinate_gets, boolean()} | %% default = true
+                  %% When selecting a coordinator, `mbox_check'
+                  %% controls wether the vnode mailbox soft-limit is
+                  %% checked. see riak#gh1661 for details. NOTE:
+                  %% defaults to `true' but will be set to `false' by
+                  %% the get_fsm when it forwards to a new get fsm
+                  %% i.e. ONLY forward once, when a coordinator is
+                  %% chosen, use it.
+                  {mbox_check, boolean()}.
 
 -type options() :: [option()].
 -type req_id() :: non_neg_integer().
+-type preflist_entry() :: {Idx::non_neg_integer(), node()}.
 
 -export_type([options/0, option/0]).
-
-
 
 -record(state, {from :: {raw, req_id(), pid()},
                 options=[] :: options(),
@@ -83,7 +98,14 @@
                 crdt_op :: undefined | true,
                 request_type :: undefined | head | get | update,
                 force_aae = false :: boolean(),
-                override_nodes = [] :: list()
+                override_nodes = [] :: list(),
+                %% do it, unless we're told not to @TODO(rdb) make
+                %% this a bucket level config, for now/WIP/discovery,
+                %% per-request is good enough
+                coordinate_gets = true,
+                bad_coordinators = [] :: [node()],
+                coordinator_timeout :: integer(),
+                coord_pl_entry :: preflist_entry()
                }).
 
 -include("riak_kv_dtrace.hrl").
@@ -191,52 +213,32 @@ prepare(timeout, StateData=#state{bkey=BKey={Bucket,_Key},
                                   options=Options,
                                   trace=Trace}) ->
     ?DTRACE(Trace, ?C_GET_FSM_PREPARE, [], ["prepare"]),
-    {ok, DefaultProps} = application:get_env(riak_core,
-                                             default_bucket_props),
-    BucketProps = riak_core_bucket:get_bucket(Bucket),
-    %% typed buckets never fall back to defaults
-    Props =
-        case is_tuple(Bucket) of
-            false ->
-                lists:keymerge(1, lists:keysort(1, BucketProps),
-                               lists:keysort(1, DefaultProps));
-            true ->
-                BucketProps
-        end,
-    DocIdx = riak_core_util:chash_key(BKey, BucketProps),
-    Bucket_N = get_option(n_val, BucketProps),
+
+    BucketProps = get_bucket_props(Bucket),
+    N = get_n_val(Options, BucketProps),
     CrdtOp = get_option(crdt_op, Options),
     ForceAAE = get_option(force_aae, Options, false),
-    N = case get_option(n_val, Options) of
-            undefined ->
-                Bucket_N;
-            N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
-                %% don't allow custom N to exceed bucket N
-                N_val;
-            Bad_N ->
-                {error, {n_val_violation, Bad_N}}
-        end,
+    StatTracked = get_option(stat_tracked, BucketProps, false),
+    %% Don't coordinate if explicitly told not to
+    Coordinate = get_option(coordinate_gets, Options, true),
+
     case N of
         {error, _} = Error ->
             StateData2 = client_reply(Error, StateData),
             {stop, normal, StateData2};
         _ ->
-            StatTracked = get_option(stat_tracked, BucketProps, false),
-            Preflist2 =
-                case get_option(sloppy_quorum, Options) of
-                    false ->
-                        riak_core_apl:get_primary_apl(DocIdx, N, riak_kv);
-                    _ ->
-                        UpNodes = riak_core_node_watcher:nodes(riak_kv),
-                        riak_core_apl:get_apl_ann(DocIdx, N, UpNodes)
-                end,
-            new_state_timeout(validate, StateData#state{starttime=riak_core_util:moment(),
-                                                n = N,
-                                                bucket_props=Props,
-                                                preflist2 = Preflist2,
-                                                tracked_bucket = StatTracked,
-                                                crdt_op = CrdtOp,
-                                                force_aae = ForceAAE})
+
+            Preflist = get_preflist(N, BKey, BucketProps, Options, _BadCoordinators=[]),
+
+            execute_coordinate_forward(StateData#state{
+                                         starttime=riak_core_util:moment(),
+                                         n = N,
+                                         bucket_props=BucketProps,
+                                         preflist2 = Preflist,
+                                         tracked_bucket = StatTracked,
+                                         crdt_op = CrdtOp,
+                                         force_aae = ForceAAE,
+                                         coordinate_gets=Coordinate})
     end.
 
 %% @private
@@ -621,6 +623,10 @@ determine_do_read_repair(SoftCap, HardCap, Actual, Roll) ->
     Threshold = AdjustedActual / AdjustedHard * 100,
     Threshold =< Roll.
 
+%% @private decide if this GET request is to be coordinated, and if so
+%% where. If not, execute in parallel as before.
+cc
+
 -ifdef(TEST).
 roll_d100() ->
     fsm_eqc_util:get_fake_rng(get_fsm_eqc).
@@ -649,17 +655,6 @@ read_repair(Indices, RepairObj,
                                          {bucket_props, BucketProps},
                                          {crdt_op, CrdtOp}]),
     ok = riak_kv_stat:update({read_repairs, Indices, Sent}).
-
-get_option(Name, Options) ->
-    get_option(Name, Options, undefined).
-
-get_option(Name, Options, Default) ->
-    case lists:keyfind(Name, 1, Options) of
-        {_, Val} ->
-            Val;
-        false ->
-            Default
-    end.
 
 schedule_timeout(infinity) ->
     undefined;
@@ -741,6 +736,56 @@ add_timing(Stage, State = #state{timing = Timing}) ->
 details() ->
     [timing,
      vnodes].
+
+%% decide about coordination, pick coordinator, etc
+execute_coordinate_forward(State=#state{coordinate_gets=false}) ->
+    %% do as we've always done
+    new_state_timeout(validate, State);
+execute_coordinate_forward(State) ->
+    #state{options=Options, preflist2=Preflist} = State,
+    %% coordination wanted, so select a coordinator
+    MBoxCheck = get_option(mbox_check, Options, true),
+
+    case select_coordinator(Preflist, MBoxCheck) of
+        {local, CoordPLEntry} ->
+            StateData = State#state{coord_pl_entry = CoordPLEntry},
+            new_state_timeout(validate, StateData);
+        {forward, ForwardNode} ->
+            forward(ForwardNode, State)
+    end.
+
+
+%% @private selects a coordinating vnode for the get, depending on
+%%  mailbox length, etc.
+-spec select_coordinator(riak_core_apl:preflist_ann(), boolean()) ->
+                                {local, preflist_entry()} |
+                                {local, undefined} |
+                                {forward, node()}.
+select_coordinator(Preflist, true=_MBoxCheck) ->
+    %% NOTE:: an annotated preflist goes in, two un-annotated come out
+    {LocalPreflist, RemotePreflist} = partition_local_remote(Preflist),
+
+    case check_mailboxes(LocalPreflist) of
+        {true, Entry} ->
+            {local, Entry};
+        {false, LocalMBoxData} ->
+            case check_mailboxes(RemotePreflist) of
+                {true, {_Idx, Remote}} ->
+                    {forward, Remote};
+                {false, RemoteMBoxData} ->
+                    select_least_loaded_coordinator(LocalMBoxData, RemoteMBoxData)
+            end
+    end;
+select_coordinator(Preflist, false=_MBoxCheck) ->
+    %% No mailbox check, probably forwarded after coordinator chosen
+    %% already
+    {LocalPreflist, _RemotePreflist} = partition_local_remote(Preflist),
+    {local, hd(LocalPreflist)};
+select_coordinator(_Preflist, any=_CoordinatorType, _MBoxCheck) ->
+    %% for `any' type coordinator downstream code expects `undefined',
+    %% no coordinator, no mailbox queues to route around
+    {local, undefined}.
+
 
 -ifdef(TEST).
 -define(expect_msg(Exp,Timeout),

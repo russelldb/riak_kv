@@ -32,6 +32,13 @@
 -include("riak_kv_types.hrl").
 
 -behaviour(gen_fsm).
+
+-import(riak_kv_fsm_common, [get_option/2, get_option/3,
+                             get_bucket_props/1,
+                             get_n_val/2,
+                             get_preflist/5,
+                             partition_local_remote/1]).
+
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
 -export([start/3,start/6,start/7]).
 -export([start_link/3,start_link/6,start_link/7]).
@@ -104,7 +111,7 @@
                 dw :: non_neg_integer(),
                 pw :: non_neg_integer(),
                 node_confirms :: non_neg_integer(),
-                coord_pl_entry :: {integer(), atom()},
+                coord_pl_entry :: preflist_entry(),
                 preflist2 :: riak_core_apl:preflist_ann(),
                 bkey :: {riak_object:bucket(), riak_object:key()},
                 req_id :: pos_integer(),
@@ -902,17 +909,6 @@ get_hooks(postcommit, BucketProps, #state{bkey=BKey}) ->
     CondHooks = riak_kv_hooks:get_conditional_postcommit(BKey, BucketProps),
     BaseHooks ++ (CondHooks -- BaseHooks).
 
-get_option(Name, Options) ->
-    get_option(Name, Options, undefined).
-
-get_option(Name, Options, Default) ->
-    case lists:keyfind(Name, 1, Options) of
-        {_, Val} ->
-            Val;
-        false ->
-            Default
-    end.
-
 schedule_timeout(infinity) ->
     undefined;
 schedule_timeout(Timeout) ->
@@ -974,34 +970,6 @@ dtrace_errstr(Term) ->
 late_put_fsm_coordinator_ack(_Node) ->
     ok.
 
--spec get_bucket_props(riak_object:bucket()) -> list().
-get_bucket_props(Bucket) ->
-    {ok, DefaultProps} = application:get_env(riak_core,
-                                             default_bucket_props),
-    BucketProps = riak_core_bucket:get_bucket(Bucket),
-    %% typed buckets never fall back to defaults
-    case is_tuple(Bucket) of
-        false ->
-            lists:keymerge(1, lists:keysort(1, BucketProps),
-                           lists:keysort(1, DefaultProps));
-        true ->
-            BucketProps
-    end.
-
-%% @private decide on the N Val for the put request, and error if
-%% there is a violation.
-get_n_val(Options, BucketProps) ->
-    Bucket_N = get_option(n_val, BucketProps),
-    case get_option(n_val, Options, false) of
-        false ->
-            Bucket_N;
-        N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
-            %% don't allow custom N to exceed bucket N
-            N_val;
-        Bad_N ->
-            {error, {n_val_violation, Bad_N}}
-    end.
-
 %% @private given no n-val violation, generate a preflist.
 get_preflist({error, _Reason}=Err, State) ->
     process_reply(Err, State);
@@ -1011,20 +979,7 @@ get_preflist(N, State) ->
            bucket_props=BucketProps,
            bad_coordinators = BadCoordinators} = State,
 
-    DocIdx = riak_core_util:chash_key(BKey, BucketProps),
-
-    Preflist =
-        case get_option(sloppy_quorum, Options, true) of
-            true ->
-                UpNodes = riak_core_node_watcher:nodes(riak_kv),
-                riak_core_apl:get_apl_ann(DocIdx, N,
-                                          UpNodes -- BadCoordinators);
-            false ->
-                Preflist0 =
-                    riak_core_apl:get_primary_apl(DocIdx, N, riak_kv),
-                [X || X = {{_Index, Node}, _Type} <- Preflist0,
-                      not lists:member(Node, BadCoordinators)]
-        end,
+    Preflist = get_preflist(N, BKey, BucketProps, Options, BadCoordinators),
 
     coordinate_or_forward(Preflist, State#state{n=N}).
 
@@ -1211,23 +1166,6 @@ get_coordinator_type(Options) ->
             any
     end.
 
-%% @private used by `coordinate_or_forward' above. Removes `Type' info
-%% from preflist entries and splits a preflist into local and remote.
--spec partition_local_remote(riak_core_apl:preflist_ann()) ->
-                                    {riak_core_apl:preflist(),
-                                     riak_core_apl:preflist()}.
-partition_local_remote(Preflist) ->
-    lists:foldl(fun partition_local_remote/2,
-                {[], []},
-                Preflist).
-
-%% @private fold fun for `partition_local_remote/1'
-partition_local_remote({{_Index, Node}=IN, _Type}, {L, R})
-  when Node == node() ->
-    {[IN | L], R};
-partition_local_remote({IN, _Type}, {L, R}) ->
-    {L, [IN | R]}.
-
 %% @private the local node is not in the preflist, or is overloaded,
 %% forward to another node
 forward(CoordNode, State) ->
@@ -1299,65 +1237,6 @@ get_coordinator_type_test() ->
     Opts1 = proplists:unfold([]),
     ?assertEqual(local, get_coordinator_type(Opts1)).
 
-get_bucket_props_test_() ->
-    BucketProps = [{bprop1, bval1},
-                   {bprop2, bval2},
-                   {prop2, bval9},
-                   {prop1, val1}],
-    DefaultProps = [{prop1, val1},
-                    {prop2, val2},
-                    {prop3, val3}],
-    {setup, fun() ->
-                    DefPropsOrig = application:get_env(riak_core,
-                                                       default_bucket_props),
-                    application:set_env(riak_core,
-                                        default_bucket_props,
-                                        DefaultProps),
-
-                    meck:new(riak_core_bucket),
-                    meck:expect(riak_core_bucket, get_bucket,
-                                fun(_) ->
-                                        BucketProps
-                                end),
-
-                    DefPropsOrig
-            end,
-     fun(DefPropsOrig) ->
-             application:set_env(riak_core,
-                                 default_bucket_props,
-                                 DefPropsOrig),
-             meck:unload(riak_core_bucket)
-
-     end,
-     [{"untyped bucket",
-       ?_test(
-          begin
-              Bucket = <<"bucket">>,
-              %% amazing, not a ukeymerge
-              Props = get_bucket_props(Bucket),
-              %% i.e. a merge with defaults
-              ?assertEqual([
-                            {bprop1,bval1},
-                            {bprop2,bval2},
-                            {prop1,val1},
-                            {prop1,val1},
-                            {prop2,bval9},
-                            {prop2,val2},
-                            {prop3,val3}
-                           ], Props)
-          end)
-      },
-      {"typed bucket",
-       ?_test(
-          begin
-              Bucket = {<<"type">>, <<"bucket">>},
-              Props = get_bucket_props(Bucket),
-              %% i.e. no merge with defaults
-              ?assertEqual(BucketProps, Props)
-          end
-         )
-      }
-     ]}.
 
 partition_local_remote_test() ->
     Node = node(),
@@ -1395,13 +1274,5 @@ partition_local_remote_test() ->
                                                             {{1, Node}, primary}
                                                            ])).
 
-get_n_val_test() ->
-    Opts0 = [],
-    BProps = [{n_val, 3}, {other, props}],
-    ?assertEqual(3, get_n_val(Opts0, BProps)),
-    Opts1 = [{n_val, 1}],
-    ?assertEqual(1, get_n_val(Opts1, BProps)),
-    Opts2 = [{n_val, 4}],
-    ?assertEqual({error, {n_val_violation, 4}}, get_n_val(Opts2, BProps)).
 
 -endif.
