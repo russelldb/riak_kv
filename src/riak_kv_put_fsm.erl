@@ -970,7 +970,6 @@ dtrace_errstr(Term) ->
 late_put_fsm_coordinator_ack(_Node) ->
     ok.
 
-
 %% @private given no n-val violation, generate a preflist.
 get_preflist({error, _Reason}=Err, State) ->
     process_reply(Err, State);
@@ -1106,4 +1105,5 @@ get_coordinator_type_test() ->
     ?assertEqual(any, get_coordinator_type(Opts0)),
     Opts1 = proplists:unfold([]),
     ?assertEqual(local, get_coordinator_type(Opts1)).
+
 -endif.

@@ -630,6 +630,10 @@ determine_do_read_repair(SoftCap, HardCap, Actual, Roll) ->
     Threshold = AdjustedActual / AdjustedHard * 100,
     Threshold =< Roll.
 
+%% @private decide if this GET request is to be coordinated, and if so
+%% where. If not, execute in parallel as before.
+cc
+
 -ifdef(TEST).
 roll_d100() ->
     fsm_eqc_util:get_fake_rng(get_fsm_eqc).
