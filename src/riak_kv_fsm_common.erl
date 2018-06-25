@@ -339,7 +339,6 @@ get_n_val_test() ->
     Opts2 = [{n_val, 4}],
     ?assertEqual({error, {n_val_violation, 4}}, get_n_val(Opts2, BProps)).
 
-
 mbox_data_sort_test() ->
     ?assert(mbox_data_sort({x, 1000, 10}, {x, error, error})),
     ?assertNot(mbox_data_sort({x, error, error}, {x, 100, 10})),
