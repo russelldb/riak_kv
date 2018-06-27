@@ -185,8 +185,8 @@ enough(_) ->
 %% Get success/fail response once enough results received
 -spec response(getcore()) -> {reply(), getcore()}.
 %% Met quorum for a standard get request/response
-response(#getcore{r = R, num_ok = NumOK, pr= PR, num_pok = NumPOK, head_merge = HM} = GetCore)
-        when NumOK >= R andalso NumPOK >= PR andalso HM == false ->
+response(#getcore{r = R, num_ok = NumOK, pr= PR, num_pok = NumPOK, head_merge = false} = GetCore)
+        when NumOK >= R andalso NumPOK >= PR  ->
     #getcore{results = Results, allow_mult=AllowMult,
         deletedvclock = DeletedVClock} = GetCore,
     {ObjState, MObj} = Merged = merge(Results, AllowMult),
