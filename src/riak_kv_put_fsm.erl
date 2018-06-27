@@ -94,13 +94,6 @@
 
 -type options() :: [option()].
 
--type preflist_entry() :: {Idx::non_neg_integer(), node()}.
-%% the information about vnode mailbox queues used to select a
-%% coordinator
--type mbox_data() :: [{preflist_entry(),
-                       MBoxSize::error | non_neg_integer(),
-                       MBoxSofLimit:: error | non_neg_integer()}] | [].
-
 -export_type([option/0, options/0, detail/0, detail_info/0]).
 
 -record(state, {from :: {raw, integer(), pid()},
@@ -111,7 +104,7 @@
                 dw :: non_neg_integer(),
                 pw :: non_neg_integer(),
                 node_confirms :: non_neg_integer(),
-                coord_pl_entry :: preflist_entry(),
+                coord_pl_entry :: riak_kv_fsm_common:preflist_entry(),
                 preflist2 :: riak_core_apl:preflist_ann(),
                 bkey :: {riak_object:bucket(), riak_object:key()},
                 req_id :: pos_integer(),
@@ -1010,16 +1003,16 @@ coordinate_or_forward(Preflist, State) ->
             ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0],
                     ["prepare", CoordPlNode]),
             new_state_timeout(validate, StateData);
-        {forward, ForwardNode} ->
+        {remote, {_Idx, ForwardNode}} ->
             forward(ForwardNode, State)
     end.
 
 %% @private selects a coordinating vnode for the put, depending on
 %% locality, mailbox length, etc.
 -spec select_coordinator(riak_core_apl:preflist_ann(), local | any, boolean()) ->
-                                {local, preflist_entry()} |
+                                {local, riak_kv_fsm_common:preflist_entry()} |
                                 {local, undefined} |
-                                {forward, node()}.
+                                {remote, riak_kv_fsm_common:preflist_entry()}.
 select_coordinator(Preflist, _CoordinatorType=local, true=_MBoxCheck) ->
     %% wants local, if there are local entries, check mailbox soft
     %% limits (see riak#1661) locally first, only checking remote if
@@ -1028,15 +1021,15 @@ select_coordinator(Preflist, _CoordinatorType=local, true=_MBoxCheck) ->
     %% NOTE:: an annotated preflist goes in, two un-annotated come out
     {LocalPreflist, RemotePreflist} = partition_local_remote(Preflist),
 
-    case check_mailboxes(LocalPreflist) of
+    case riak_kv_fsm_common:check_mailboxes(LocalPreflist) of
         {true, Entry} ->
             {local, Entry};
         {false, LocalMBoxData} ->
-            case check_mailboxes(RemotePreflist) of
-                {true, {_Idx, Remote}} ->
-                    {forward, Remote};
+            case riak_kv_fsm_common:check_mailboxes(RemotePreflist) of
+                {true, Remote} ->
+                    {remote, Remote};
                 {false, RemoteMBoxData} ->
-                    select_least_loaded_coordinator(LocalMBoxData, RemoteMBoxData)
+                    riak_kv_fsm_common:select_least_loaded_entry(LocalMBoxData, RemoteMBoxData)
             end
     end;
 select_coordinator(Preflist, _CoordinatorType=local, false=_MBoxCheck) ->
@@ -1047,113 +1040,6 @@ select_coordinator(_Preflist, any=_CoordinatorType, _MBoxCheck) ->
     %% for `any' type coordinator downstream code expects `undefined',
     %% no coordinator, no mailbox queues to route around
     {local, undefined}.
-
-%% @private @TODO test to find the best strategy
--spec select_least_loaded_coordinator(list(), list()) -> {local, {pos_integer(), node()}} |
-                                                         {forward, node()}.
-select_least_loaded_coordinator([]=_LocalMboxData, RemoteMBoxData) ->
-    [{{_Idx, Node}, _, _} | _Rest] = lists:sort(fun mbox_data_sort/2, RemoteMBoxData),
-    lager:debug("loaded forward"),
-    {forward, Node};
-select_least_loaded_coordinator(LocalMBoxData, _RemoteMBoxData) ->
-    [{Entry, _, _} | _Rest] = lists:sort(fun mbox_data_sort/2, LocalMBoxData),
-    lager:warning("soft-loaded local coordinator"),
-    {local, Entry}.
-
-%% @private used by select_least_loaded_coordinator/2 to sort mbox
-%% data results
-mbox_data_sort({_, error, error}, {_, error, error}) ->
-    %% @TODO do we use random here, so that a list full of errors
-    %% picks a random node to forward to (as per pre-gh1661 code)?
-    case random:uniform_s(2, os:timestamp()) of
-        {1, _} ->
-            true;
-        {2, _} ->
-            false
-    end;
-mbox_data_sort({_, error, error}, {_, _Load, _Limit}) ->
-    false;
-mbox_data_sort({_, _LoadA, _LimitA}, {_, error, error}) ->
-    true;
-mbox_data_sort({_, LoadA, _LimitA}, {_, LoadB, _LimitB})   ->
-    %% @TODO should we randomise where load is equal? Or let load take
-    %% care of it (i.e. is we always choose NodeA, it will get a
-    %% longer queue and we will choose NodeB)
-    LoadA =< LoadB.
-
--define(DEFAULT_MBOX_CHECK_TIMEOUT_MILLIS, 100).
-
-%% @private check the mailboxes for the preflist.
--spec check_mailboxes(riak_core_apl:preflist()) ->
-                             {true, preflist_entry()} |
-                             {false, mbox_data()}.
-check_mailboxes([]) ->
-    %% shortcut for empty (local)preflist
-    {false, []};
-check_mailboxes(Preflist) ->
-    TimeLimit = get_timestamp_millis() + ?DEFAULT_MBOX_CHECK_TIMEOUT_MILLIS,
-    _ = [check_mailbox(Entry) || Entry <- Preflist],
-    case join_mbox_replies(length(Preflist),
-                           TimeLimit,
-                           []) of
-        {true, Entry} ->
-            {true, Entry};
-        {ok, MBoxData} ->
-            %% all replies in, none are below soft-limit
-            {false, MBoxData};
-        {timeout, MBoxData0} ->
-            lager:warning("Mailbox soft-load poll timout ~p",
-                          [?DEFAULT_MBOX_CHECK_TIMEOUT_MILLIS]),
-            MBoxData = add_errors_to_mbox_data(Preflist, MBoxData0),
-            {false, MBoxData}
-    end.
-
-%% @private cast off to vnode proxy for mailbox size.
--spec check_mailbox(preflist_entry()) -> ok.
-check_mailbox({Idx, Node}=Entry) ->
-    RegName = riak_core_vnode_proxy:reg_name(riak_kv_vnode, Idx, Node),
-    riak_core_vnode_proxy:cast(RegName, {mailbox_size, self(), Entry}).
-
-%% @private wait at most `TimeOutMillis' for `HowMany' `{mbox, _}'
-%% replies from riak_core_vnode_proxy. Returns either `Acc' as mbox
-%% data or short-circuits to `{true, Entry}' if any proxy replies
-%% below the soft limit.
--spec join_mbox_replies(NumReplies::non_neg_integer(),
-                        Timeout::pos_integer(), Acc::mbox_data()) ->
-                               {true, preflist_entry()} |
-                               {timeout, mbox_data()} |
-                               {ok, mbox_data()}.
-join_mbox_replies(0, _TimeLimit, Acc) ->
-    {ok, Acc};
-join_mbox_replies(HowMany, TimeLimit, Acc) ->
-    TimeOut = max(0, TimeLimit - get_timestamp_millis()),
-    receive
-        {mbox, {Entry, {ok, _Mbox, _Limit}}} ->
-            %% shortcut it
-            {true, Entry};
-        {mbox, {Entry, {soft_loaded, MBox, Limit}}} ->
-            %% Keep waiting @TODO warning? Over 2million in 24h load test!
-            lager:debug("Mailbox for ~p with soft-overload", [Entry]),
-            join_mbox_replies(HowMany-1, TimeLimit,
-                 [{Entry, MBox, Limit} | Acc])
-    after TimeOut ->
-            {timeout, Acc}
-    end.
-
-%% @private in the case that some preflist entr(y|ies) did not respond
-%% in time, add them to the mbox data result as `error' entries.
--spec add_errors_to_mbox_data(riak_core_apl:preflist(), mbox_data()) ->
-                                     mbox_data().
-add_errors_to_mbox_data(Preflist, Acc) ->
-    lists:map(fun(Entry) ->
-                      case lists:keyfind(Entry, 1, Acc) of
-                          false ->
-                              lager:warning("Mailbox for ~p did not return in time", [Entry]),
-                              {Entry, error, error};
-                          Res ->
-                              Res
-                      end
-              end, Preflist).
 
 %% @private decide if the coordinator has to be a local, causality
 %% advancing vnode, or just any/all at once
@@ -1205,74 +1091,12 @@ forward(CoordNode, State) ->
             process_reply({error, {coord_handoff_failed, Reason}}, State)
     end.
 
--spec get_timestamp_millis() -> pos_integer().
-get_timestamp_millis() ->
-  {Mega, Sec, Micro} = os:timestamp(),
-  (Mega*1000000 + Sec)*1000 + round(Micro/1000).
-
 -ifdef(TEST).
-
-mbox_data_sort_test() ->
-    ?assert(mbox_data_sort({x, error, error}, {x, error, error})),
-    ?assert(mbox_data_sort({x, 1000, 10}, {x, error, error})),
-    ?assertNot(mbox_data_sort({x, error, error}, {x, 100, 10})),
-    ?assertNot(mbox_data_sort({x, 10, 10}, {x, 1, 10})),
-    ?assert(mbox_data_sort({x, 10, 10}, {x, 10, 10})),
-    ?assert(mbox_data_sort({x, 1, 10}, {x, 10, 10})).
-
-select_least_loaded_coordinator_test() ->
-    MBoxData = [{{0, nodex}, 100, 10},
-                {{1919191919, nodey}, 10, 10},
-                {{91829, nodez}, error, error},
-                {{100, nodea}, 1, 10},
-                {{90, nodeb}, error, error},
-                {{182, c}, 10001, 10}],
-    ?assertEqual({local, {100, nodea}}, select_least_loaded_coordinator(MBoxData, [])),
-    ?assertEqual({forward, nodea}, select_least_loaded_coordinator([], MBoxData)),
-    ?assertEqual({local, {100, nodea}}, select_least_loaded_coordinator(MBoxData, MBoxData)).
 
 get_coordinator_type_test() ->
     Opts0 = proplists:unfold([asis]),
     ?assertEqual(any, get_coordinator_type(Opts0)),
     Opts1 = proplists:unfold([]),
     ?assertEqual(local, get_coordinator_type(Opts1)).
-
-
-partition_local_remote_test() ->
-    Node = node(),
-    PL1 = [
-           {{0, 'node0'}, primary},
-           {{1, Node}, fallback},
-           {{2, 'node1'}, primary}
-          ],
-    ?assertEqual({
-                   [{1, Node}],
-                   [{2, 'node1'},
-                    {0, 'node0'}]
-                 }, partition_local_remote(PL1)),
-
-    PL2 = [
-           {{0, 'node0'}, primary},
-           {{1, Node}, fallback},
-           {{2, Node}, primary},
-           {{3, 'node0'}, fallback}
-          ],
-
-    ?assertEqual({
-                   [{2, Node},
-                    {1, Node}],
-                   [{3, 'node0'},
-                    {0, 'node0'}]
-                 }, partition_local_remote(PL2)),
-    ?assertEqual({[], []}, partition_local_remote([])),
-    ?assertEqual({[], [{3, 'node0'},
-                       {0, 'node0'}]}, partition_local_remote([
-                                                               {{0, 'node0'}, primary},
-                                                               {{3, 'node0'}, fallback}
-                                                              ])),
-    ?assertEqual({[{1, Node}], []}, partition_local_remote([
-                                                            {{1, Node}, primary}
-                                                           ])).
-
 
 -endif.

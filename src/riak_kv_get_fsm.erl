@@ -26,7 +26,7 @@
 -import(riak_kv_fsm_common, [get_option/2, get_option/3,
                              get_bucket_props/1,
                              get_n_val/2,
-                             get_preflist/5,
+                             get_preflist/4,
                              partition_local_remote/1]).
 
 -include_lib("riak_kv_vnode.hrl").
@@ -61,19 +61,12 @@
                   {sloppy_quorum, boolean()} | %% default = true
                   {n_val, pos_integer()} |     %% default = bucket props
                   {crdt_op, true | undefined} | %% default = undefined
-                  {coordinate_gets, boolean()} | %% default = true
-                  %% When selecting a coordinator, `mbox_check'
-                  %% controls wether the vnode mailbox soft-limit is
-                  %% checked. see riak#gh1661 for details. NOTE:
-                  %% defaults to `true' but will be set to `false' by
-                  %% the get_fsm when it forwards to a new get fsm
-                  %% i.e. ONLY forward once, when a coordinator is
-                  %% chosen, use it.
-                  {mbox_check, boolean()}.
+                  {request_strategy, request_strategy()}. %% default = get_head
 
 -type options() :: [option()].
 -type req_id() :: non_neg_integer().
 -type preflist_entry() :: {Idx::non_neg_integer(), node()}.
+-type request_strategy() :: get_then_head_plhead | get_then_head_softlimt | head_then_get.
 
 -export_type([options/0, option/0]).
 
@@ -102,10 +95,8 @@
                 %% do it, unless we're told not to @TODO(rdb) make
                 %% this a bucket level config, for now/WIP/discovery,
                 %% per-request is good enough
-                coordinate_gets = true,
-                bad_coordinators = [] :: [node()],
-                coordinator_timeout :: integer(),
-                coord_pl_entry :: preflist_entry()
+                request_strategy = get_then_head_softlimt :: request_strategy(),
+                get_pl_entry :: preflist_entry()
                }).
 
 -include("riak_kv_dtrace.hrl").
@@ -114,6 +105,7 @@
 -define(DEFAULT_R, default).
 -define(DEFAULT_PR, 0).
 -define(DEFAULT_RT, head).
+-define(DEFAULT_REQUEST_STRATEGY, get_then_head_softlimt).
 
 %% ===================================================================
 %% Public API
@@ -219,26 +211,29 @@ prepare(timeout, StateData=#state{bkey=BKey={Bucket,_Key},
     CrdtOp = get_option(crdt_op, Options),
     ForceAAE = get_option(force_aae, Options, false),
     StatTracked = get_option(stat_tracked, BucketProps, false),
-    %% Don't coordinate if explicitly told not to
-    Coordinate = get_option(coordinate_gets, Options, true),
+    %% Request strategy
+    RequestStrategy = get_option(request_strategy, Options, ?DEFAULT_REQUEST_STRATEGY),
 
     case N of
         {error, _} = Error ->
             StateData2 = client_reply(Error, StateData),
             {stop, normal, StateData2};
         _ ->
+            Preflist = get_preflist(N, BKey, BucketProps, Options),
+            GetPlEntry = select_get_entry(Preflist, RequestStrategy),
 
-            Preflist = get_preflist(N, BKey, BucketProps, Options, _BadCoordinators=[]),
-
-            execute_coordinate_forward(StateData#state{
-                                         starttime=riak_core_util:moment(),
-                                         n = N,
-                                         bucket_props=BucketProps,
-                                         preflist2 = Preflist,
-                                         tracked_bucket = StatTracked,
-                                         crdt_op = CrdtOp,
-                                         force_aae = ForceAAE,
-                                         coordinate_gets=Coordinate})
+            new_state_timeout(validate,
+                               StateData#state{
+                                 starttime=riak_core_util:moment(),
+                                 n = N,
+                                 bucket_props=BucketProps,
+                                 preflist2 = Preflist,
+                                 tracked_bucket = StatTracked,
+                                 crdt_op = CrdtOp,
+                                 force_aae = ForceAAE,
+                                 request_strategy = RequestStrategy,
+                                 get_pl_entry = GetPlEntry
+                                })
     end.
 
 %% @private
@@ -309,8 +304,11 @@ execute(timeout, StateData0=#state{timeout=Timeout,req_id=ReqId,
                                    preflist2 = Preflist2,
                                    get_core = GetCore,
                                    request_type = RequestType,
+                                   get_pl_entry = GetPlEntry,
                                    override_nodes = OverNodes}) ->
-    Preflist = [IndexNode || {IndexNode, _Type} <- Preflist2],
+    %% filter the preflist of the GET entry
+    Preflist = [IndexNode || {IndexNode, _Type} <- Preflist2,
+               IndexNode /= GetPlEntry],
     TRef = schedule_timeout(Timeout),
     case Trace of
         true ->
@@ -334,8 +332,17 @@ execute(timeout, StateData0=#state{timeout=Timeout,req_id=ReqId,
                 % response in riak_get_core the specific head_merge function
                 % will be used
                 %
-                % Send head requests to all the Preflist
-                riak_kv_vnode:head(Preflist, BKey, ReqId),
+                % Maybe get from one entry, and send head requests to
+                % all the rest of the Preflist
+
+                case GetPlEntry of
+                    undefined ->
+                        riak_kv_vnode:head(Preflist, BKey, ReqId);
+                    Entry ->
+                        %% Perform a GET
+                        riak_kv_vnode:get([Entry], BKey, ReqId),
+                        riak_kv_vnode:head(Preflist, BKey, ReqId)
+                end,
                 HO_GetCore = riak_kv_get_core:head_merge(GetCore),
                 StateData0#state{tref=TRef, get_core = HO_GetCore};
             update ->
@@ -625,7 +632,6 @@ determine_do_read_repair(SoftCap, HardCap, Actual, Roll) ->
 
 %% @private decide if this GET request is to be coordinated, and if so
 %% where. If not, execute in parallel as before.
-cc
 
 -ifdef(TEST).
 roll_d100() ->
@@ -737,55 +743,37 @@ details() ->
     [timing,
      vnodes].
 
-%% decide about coordination, pick coordinator, etc
-execute_coordinate_forward(State=#state{coordinate_gets=false}) ->
-    %% do as we've always done
-    new_state_timeout(validate, State);
-execute_coordinate_forward(State) ->
-    #state{options=Options, preflist2=Preflist} = State,
-    %% coordination wanted, so select a coordinator
-    MBoxCheck = get_option(mbox_check, Options, true),
+%% @private selects a vnode for the get, depending on mailbox length,
+%% etc.
+-spec select_get_entry(riak_core_apl:preflist_ann(), request_strategy()) ->
+                              undefined | preflist_entry().
+select_get_entry(Preflist, get_then_head_softlimt) ->
+    %% Pick the least loaded (ideally local) vnode to perform a
+    %% GET. The other entries will be used for HEADs.
 
-    case select_coordinator(Preflist, MBoxCheck) of
-        {local, CoordPLEntry} ->
-            StateData = State#state{coord_pl_entry = CoordPLEntry},
-            new_state_timeout(validate, StateData);
-        {forward, ForwardNode} ->
-            forward(ForwardNode, State)
-    end.
-
-
-%% @private selects a coordinating vnode for the get, depending on
-%%  mailbox length, etc.
--spec select_coordinator(riak_core_apl:preflist_ann(), boolean()) ->
-                                {local, preflist_entry()} |
-                                {local, undefined} |
-                                {forward, node()}.
-select_coordinator(Preflist, true=_MBoxCheck) ->
-    %% NOTE:: an annotated preflist goes in, two un-annotated come out
     {LocalPreflist, RemotePreflist} = partition_local_remote(Preflist),
 
-    case check_mailboxes(LocalPreflist) of
+    case riak_kv_fsm_common:check_mailboxes(LocalPreflist) of
         {true, Entry} ->
-            {local, Entry};
+            Entry;
         {false, LocalMBoxData} ->
-            case check_mailboxes(RemotePreflist) of
+            case riak_kv_fsm_common:check_mailboxes(RemotePreflist) of
                 {true, {_Idx, Remote}} ->
-                    {forward, Remote};
+                     Remote;
                 {false, RemoteMBoxData} ->
-                    select_least_loaded_coordinator(LocalMBoxData, RemoteMBoxData)
+                    riak_kv_fsm_common:select_least_loaded_entry(LocalMBoxData, RemoteMBoxData)
             end
     end;
-select_coordinator(Preflist, false=_MBoxCheck) ->
-    %% No mailbox check, probably forwarded after coordinator chosen
-    %% already
-    {LocalPreflist, _RemotePreflist} = partition_local_remote(Preflist),
-    {local, hd(LocalPreflist)};
-select_coordinator(_Preflist, any=_CoordinatorType, _MBoxCheck) ->
-    %% for `any' type coordinator downstream code expects `undefined',
-    %% no coordinator, no mailbox queues to route around
-    {local, undefined}.
-
+select_get_entry(Preflist, get_then_head_plhead) ->
+    %% always choose the head of the preflist, for maximum disk cache
+    %% use (but possible worse behaviour if the head node is
+    %% anavailable?) The chosen entry will be used to do a GET, while
+    %% the other entries will be used for HEAD requests
+    hd(Preflist);
+select_get_entry(_Preflist, head_then_get) ->
+    %% no preselection of a vnode to GET from, do N heads, then pick a
+    %% GET vnode (see `execute')
+    undefined.
 
 -ifdef(TEST).
 -define(expect_msg(Exp,Timeout),
