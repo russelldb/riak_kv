@@ -341,7 +341,6 @@ get_n_val_test() ->
 
 
 mbox_data_sort_test() ->
-    ?assert(mbox_data_sort({x, error, error}, {x, error, error})),
     ?assert(mbox_data_sort({x, 1000, 10}, {x, error, error})),
     ?assertNot(mbox_data_sort({x, error, error}, {x, 100, 10})),
     ?assertNot(mbox_data_sort({x, 10, 10}, {x, 1, 10})),
