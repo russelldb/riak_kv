@@ -645,9 +645,14 @@ handle_info({ack, Node, now_executing}, StateName, StateData) ->
     late_put_fsm_coordinator_ack(Node),
     ok = riak_kv_stat:update(late_put_fsm_coordinator_ack),
     {next_state, StateName, StateData};
-handle_info({mbox, _}, StateName, StateData) ->
+handle_info({mbox, _}, StateName, StateData)  ->
     %% Delayed mailbox size check response, ignore it
-    {next_state, StateName, StateData};
+    case timeout_state(StateName) of
+	true ->
+	    {next_state, StateName, StateData, 0};
+	false ->
+	    {next_state, StateName, StateData}
+    end;
 handle_info(_Info, _StateName, StateData) ->
     {stop,badmsg,StateData}.
 
@@ -661,6 +666,21 @@ code_change(_OldVsn, StateName, State, _Extra) -> {ok, StateName, State}.
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
+%% @private the `prepare' state sends some `soft-limit' messages to
+%% vnode proxies. It only waits for the first good response. The rest
+%% of the responses will be handled by `handle_info'. Some states (see
+%% function body) are transitioned to via a `timeout' event. This
+%% event is set up by the return from the previous state. The docs for
+%% gen_fsm say: "If an integer timeout value is provided, a timeout
+%% will occur unless an event or a message is received within Timeout
+%% milliseconds". In cases where the message is on the mailbox before
+%% a state finishes, the Timeout is cancelled before it begins, and
+%% handle_info is called, unless handle_info returns a timeout the fsm
+%% can just hang in the new state. This function decides if
+%% `StateName' is such a state that needs a 0 timeout adding to the
+%% return from handle_info.
+timeout_state(StateName) ->
+    lists:member(StateName, [validate, precommit, postcommit, finish]).
 
 %% Move to the new state, marking the time it started
 new_state(StateName, StateData=#state{trace = true}) ->
