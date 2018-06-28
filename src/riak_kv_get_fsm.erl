@@ -336,6 +336,7 @@ execute(timeout, StateData0=#state{timeout=Timeout,req_id=ReqId,
                 %
                 % Maybe get from one entry, and send head requests to
                 % all the rest of the Preflist
+
                 case GetPlEntry of
                     undefined ->
                         riak_kv_vnode:head(Preflist, BKey, ReqId);
@@ -655,6 +656,9 @@ determine_do_read_repair(SoftCap, HardCap, Actual, Roll) ->
     AdjustedHard = HardCap - SoftCap,
     Threshold = AdjustedActual / AdjustedHard * 100,
     Threshold =< Roll.
+
+%% @private decide if this GET request is to be coordinated, and if so
+%% where. If not, execute in parallel as before.
 
 -ifdef(TEST).
 roll_d100() ->
