@@ -213,7 +213,6 @@ prepare(timeout, StateData=#state{bkey=BKey={Bucket,_Key},
     StatTracked = get_option(stat_tracked, BucketProps, false),
     %% Request strategy
     RequestStrategy = get_option(request_strategy, Options, ?DEFAULT_REQUEST_STRATEGY),
-
     case N of
         {error, _} = Error ->
             StateData2 = client_reply(Error, StateData),
@@ -222,18 +221,19 @@ prepare(timeout, StateData=#state{bkey=BKey={Bucket,_Key},
             Preflist = get_preflist(N, BKey, BucketProps, Options),
             GetPlEntry = select_get_entry(Preflist, RequestStrategy),
 
-            new_state_timeout(validate,
-                               StateData#state{
-                                 starttime=riak_core_util:moment(),
-                                 n = N,
-                                 bucket_props=BucketProps,
-                                 preflist2 = Preflist,
-                                 tracked_bucket = StatTracked,
-                                 crdt_op = CrdtOp,
-                                 force_aae = ForceAAE,
-                                 request_strategy = RequestStrategy,
-                                 get_pl_entry = GetPlEntry
-                                })
+            Res = new_state_timeout(validate,
+				    StateData#state{
+				      starttime=riak_core_util:moment(),
+				      n = N,
+				      bucket_props=BucketProps,
+				      preflist2 = Preflist,
+				      tracked_bucket = StatTracked,
+				      crdt_op = CrdtOp,
+				      force_aae = ForceAAE,
+				      request_strategy = RequestStrategy,
+				      get_pl_entry = GetPlEntry
+				     }),
+	    Res
     end.
 
 %% @private
@@ -273,6 +273,7 @@ validate(timeout, StateData=#state{from = {raw, ReqId, _Pid}, options = Options,
             GetCore = riak_kv_get_core:init(N, R, PR, FailThreshold,
                                             NotFoundOk, AllowMult,
                                             DeletedVClock, IdxType),
+
             new_state_timeout(execute, StateData#state{get_core = GetCore,
                                                        timeout = Timeout,
                                                        req_id = ReqId});
@@ -307,6 +308,7 @@ execute(timeout, StateData0=#state{timeout=Timeout,req_id=ReqId,
                                    get_pl_entry = GetPlEntry,
                                    override_nodes = OverNodes}) ->
     %% filter the preflist of the GET entry
+
     Preflist = [IndexNode || {IndexNode, _Type} <- Preflist2,
                IndexNode /= GetPlEntry],
     TRef = schedule_timeout(Timeout),
@@ -473,6 +475,14 @@ handle_sync_event(_Event, _From, _StateName, StateData) ->
 %% @private
 handle_info(request_timeout, StateName, StateData) ->
     ?MODULE:StateName(request_timeout, StateData);
+handle_info({mbox, _}, StateName, StateData) ->
+    %% Delayed mailbox size check response, ignore it
+    case timeout_state(StateName) of
+	true ->
+	    {next_state, StateName, StateData, 0};
+	false ->
+	    {next_state, StateName, StateData}
+    end;
 %% @private
 handle_info(_Info, _StateName, StateData) ->
     {stop,badmsg,StateData}.
@@ -488,6 +498,23 @@ code_change(_OldVsn, StateName, State, _Extra) -> {ok, StateName, State}.
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
+
+%% @private the `prepare' state sends some `soft-limit' messages to
+%% vnode proxies. It only waits for the first good response. The rest
+%% of the responses will be handled by `handle_info'. Some states (see
+%% function body) are transitioned to via a `timeout' event. This
+%% event is set up by the return from the previous state. The docs for
+%% gen_fsm say: "If an integer timeout value is provided, a timeout
+%% will occur unless an event or a message is received within Timeout
+%% milliseconds". In cases where the message is on the mailbox before
+%% a state finishes, the Timeout is cancelled before it begins, and
+%% handle_info is called, unless handle_info returns a timeout the fsm
+%% can just hang in the new state. This function decides if
+%% `StateName' is such a state that needs a 0 timeout adding to the
+%% return from handle_info.
+timeout_state(StateName) ->
+    lists:member(StateName, [validate, execute]).
+
 
 %% Move to the new state, marking the time it started
 new_state(StateName, StateData=#state{trace = true}) ->
@@ -755,10 +782,11 @@ select_get_entry(Preflist, get_then_head_softlimt) ->
             Entry;
         {false, LocalMBoxData} ->
             case riak_kv_fsm_common:check_mailboxes(RemotePreflist) of
-                {true, {_Idx, Remote}} ->
+                {true, Remote} ->
                      Remote;
                 {false, RemoteMBoxData} ->
-                    riak_kv_fsm_common:select_least_loaded_entry(LocalMBoxData, RemoteMBoxData)
+                    {_Loc, Entry} = riak_kv_fsm_common:select_least_loaded_entry(LocalMBoxData, RemoteMBoxData),
+		    Entry
             end
     end;
 select_get_entry(Preflist, get_then_head_plhead) ->
@@ -766,7 +794,8 @@ select_get_entry(Preflist, get_then_head_plhead) ->
     %% use (but possible worse behaviour if the head node is
     %% anavailable?) The chosen entry will be used to do a GET, while
     %% the other entries will be used for HEAD requests
-    hd(Preflist);
+    {Entry, _Type} = hd(Preflist),
+    Entry;
 select_get_entry(_Preflist, head_then_get) ->
     %% no preselection of a vnode to GET from, do N heads, then pick a
     %% GET vnode (see `execute')
