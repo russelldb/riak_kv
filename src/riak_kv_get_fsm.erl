@@ -185,10 +185,12 @@ init([From, Bucket, Key, Options0]) ->
         _ ->
             ok
     end,
-    {ok, prepare, StateData, 0};
+    timeout_transition(),
+    {ok, prepare, StateData};
 init({test, Args, StateProps}) ->
-    %% Call normal init
-    {ok, prepare, StateData, 0} = init(Args),
+    %% Call normal init NOTE: timeout transition called by init/1, if
+    %% that code changes, then a timeout_transition is needed!
+    {ok, prepare, StateData} = init(Args),
 
     %% Then tweak the state record with entries provided by StateProps
     Fields = record_info(fields, state),
@@ -198,7 +200,8 @@ init({test, Args, StateProps}) ->
                 setelement(Pos, State0, Value)
         end,
     TestStateData = lists:foldl(F, StateData, StateProps),
-    {ok, validate, TestStateData, 0}.
+
+    {ok, validate, TestStateData}.
 
 %% @private
 prepare(timeout, StateData=#state{bkey=BKey={Bucket,_Key},
@@ -477,12 +480,7 @@ handle_info(request_timeout, StateName, StateData) ->
     ?MODULE:StateName(request_timeout, StateData);
 handle_info({mbox, _}, StateName, StateData) ->
     %% Delayed mailbox size check response, ignore it
-    case timeout_state(StateName) of
-	true ->
-	    {next_state, StateName, StateData, 0};
-	false ->
-	    {next_state, StateName, StateData}
-    end;
+    {next_state, StateName, StateData};
 %% @private
 handle_info(_Info, _StateName, StateData) ->
     {stop,badmsg,StateData}.
@@ -499,22 +497,6 @@ code_change(_OldVsn, StateName, State, _Extra) -> {ok, StateName, State}.
 %% Internal functions
 %% ====================================================================
 
-%% @private the `prepare' state sends some `soft-limit' messages to
-%% vnode proxies. It only waits for the first good response. The rest
-%% of the responses will be handled by `handle_info'. Some states (see
-%% function body) are transitioned to via a `timeout' event. This
-%% event is set up by the return from the previous state. The docs for
-%% gen_fsm say: "If an integer timeout value is provided, a timeout
-%% will occur unless an event or a message is received within Timeout
-%% milliseconds". In cases where the message is on the mailbox before
-%% a state finishes, the Timeout is cancelled before it begins, and
-%% handle_info is called, unless handle_info returns a timeout the fsm
-%% can just hang in the new state. This function decides if
-%% `StateName' is such a state that needs a 0 timeout adding to the
-%% return from handle_info.
-timeout_state(StateName) ->
-    lists:member(StateName, [validate, execute]).
-
 
 %% Move to the new state, marking the time it started
 new_state(StateName, StateData=#state{trace = true}) ->
@@ -525,9 +507,18 @@ new_state(StateName, StateData) ->
 %% Move to the new state, marking the time it started and trigger an immediate
 %% timeout.
 new_state_timeout(StateName, StateData=#state{trace = true}) ->
-    {next_state, StateName, add_timing(StateName, StateData), 0};
+    timeout_transition(),
+    {next_state, StateName, add_timing(StateName, StateData)};
 new_state_timeout(StateName, StateData) ->
-    {next_state, StateName, StateData, 0}.
+    timeout_transition(),
+    {next_state, StateName, StateData}.
+
+%% @private used instead of {next_state, StateName, StateData, 0} to
+%% trigger a timeout. See
+%% https://github.com/basho/riak_kv/commit/0a5bb8cdf86d8a211b6aac22c4f4ae41dfa937bc
+%% for details.
+timeout_transition() ->
+    gen_fsm:send_event(self(), timeout).
 
 maybe_finalize(StateData=#state{get_core = GetCore}) ->
     case riak_kv_get_core:has_all_results(GetCore) of
