@@ -20,7 +20,7 @@
 %%
 %% -------------------------------------------------------------------
 -module(riak_kv_get_core).
--export([init/8, update_init/2, head_merge/1,
+-export([init/8, update_init/2, get_init/2, head_merge/1,
             add_result/3, update_result/4, result_shortcode/1,
             enough/1, response/1, has_all_results/1, final_action/1, info/1]).
 -export_type([getcore/0, result/0, reply/0, final_action/0]).
@@ -47,6 +47,7 @@
                   r :: pos_integer(),
                   pr :: pos_integer(),
                   ur :: non_neg_integer(), % updated reads
+                  gr :: non_neg_integer(), %% get reads
                   fail_threshold :: pos_integer(),
                   notfound_ok :: boolean(),
                   allow_mult :: boolean(),
@@ -60,6 +61,7 @@
                   num_deleted = 0 :: non_neg_integer(),
                   num_fail = 0 :: non_neg_integer(),
                   num_upd = 0 :: non_neg_integer(),
+                  num_gr = 0 :: non_neg_integer(),
                   idx_type :: idx_type(),
                   head_merge = false :: boolean()}).
 -opaque getcore() :: #getcore{}.
@@ -90,6 +92,12 @@ update_init(N, PrevGetCore) ->
     PrevGetCore#getcore{ur = N,
                         head_merge = true}.
 
+%% Re-initialise a get to a single vnode that must respond
+-spec get_init(N::pos_integer(), getcore()) -> getcore().
+get_init(N, PrevGetCore) ->
+    PrevGetCore#getcore{gr = N,
+                        head_merge=true}.
+
 %% Convert the get so that it is expecting to potentially receive the
 %% responses to head requests (though for backwards compatibility these may
 %% actually still be get responses)
@@ -104,9 +112,14 @@ add_result(Idx, {ok, RObj} = Result, GetCore) ->
         true ->  1;
         false -> 0
     end,
+    GetIncr = case riak_object:is_head(RObj) of
+                  true -> 0;
+                  false -> 1
+              end,
     num_pr(GetCore#getcore{
             results = [{Idx, Result}|GetCore#getcore.results],
             merged = undefined,
+             num_gr = GetCore#getcore.num_gr + GetIncr,
             num_ok = GetCore#getcore.num_ok + 1,
             num_deleted = GetCore#getcore.num_deleted + Dels}, Idx);
 add_result(Idx, {error, notfound} = Result, GetCore) ->
@@ -164,20 +177,22 @@ result_shortcode(_)                 -> -1.
 %% Check if enough results have been added to respond
 -spec enough(getcore()) -> boolean().
 %% Met quorum
-enough(#getcore{r = R, ur = UR, pr= PR,
-                    num_ok = NumOK, num_pok = NumPOK,
-                    num_upd = NumUPD})
-        when NumOK >= R andalso NumPOK >= PR andalso NumUPD >= UR ->
+enough(#getcore{r = R, ur = UR, pr= PR, gr = GR,
+                num_ok = NumOK, num_pok = NumPOK,
+                num_upd = NumUPD,
+                num_gr = NumGR
+               })
+  when NumOK >= R andalso NumPOK >= PR andalso NumUPD >= UR andalso NumGR >= GR ->
     true;
 %% too many failures
 enough(#getcore{fail_threshold = FailThreshold, num_notfound = NumNotFound,
-            num_fail = NumFail})
-        when NumNotFound + NumFail >= FailThreshold ->
+                num_fail = NumFail})
+  when NumNotFound + NumFail >= FailThreshold ->
     true;
 %% Got all N responses, but unable to satisfy PR
 enough(#getcore{n = N, ur = UR, num_ok = NumOK, num_notfound = NumNotFound,
-            num_fail = NumFail})
-        when NumOK + NumNotFound + NumFail >= N andalso UR == 0 ->
+                num_fail = NumFail})
+  when NumOK + NumNotFound + NumFail >= N andalso UR == 0 ->
     true;
 enough(_) ->
     false.

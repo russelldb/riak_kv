@@ -341,14 +341,21 @@ execute(timeout, StateData0=#state{timeout=Timeout,req_id=ReqId,
                 % all the rest of the Preflist
                 case GetPlEntry of
                     undefined ->
-                        riak_kv_vnode:head(Preflist, BKey, ReqId);
+                        riak_kv_vnode:head(Preflist, BKey, ReqId),
+                        HO_GetCore = riak_kv_get_core:head_merge(GetCore),
+                        StateData0#state{tref=TRef, get_core = HO_GetCore};
                     Entry ->
-                        %% Perform a GET
+                        %% Perform a GET finagle the get core so that
+                        %% we wait for the get response (by pretending
+                        %% we need an update response
                         riak_kv_vnode:get([Entry], BKey, ReqId),
-                        riak_kv_vnode:head(Preflist, BKey, ReqId)
-                end,
-                HO_GetCore = riak_kv_get_core:head_merge(GetCore),
-                StateData0#state{tref=TRef, get_core = HO_GetCore};
+                        riak_kv_vnode:head(Preflist, BKey, ReqId),
+                        %% tell get core we need to wait for one
+                        %% GET response
+                        NewGC = riak_kv_get_core:get_init(1, GetCore),
+                        HO_GetCore = riak_kv_get_core:head_merge(NewGC),
+                        StateData0#state{tref=TRef, get_core = HO_GetCore}
+                end;
             update ->
                 % Need to send get requests, but still merge using head_merge
                 % as there will still be head results in the result list, and

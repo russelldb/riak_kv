@@ -289,8 +289,7 @@ find_bestobject(FetchedItems) ->
     end.
 
 
-%% @private Check if an object is simply a head response
-
+%% @doc Check if an object is simply a head response
 is_head({ok, Obj}) ->
     C0 = lists:nth(1, Obj#r_object.contents),
     case C0#r_content.value of
