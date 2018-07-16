@@ -70,7 +70,7 @@
 
 -export_type([options/0, option/0]).
 
--define(DEFAULT_REQUEST_STRATEGY, get_then_head_local).
+-define(DEFAULT_REQUEST_STRATEGY, get_then_head_plhead).
 
 -record(state, {from :: {raw, req_id(), pid()},
                 options=[] :: options(),
