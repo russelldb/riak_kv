@@ -771,32 +771,35 @@ details() ->
 select_get_entry(Preflist, get_then_head_softlimt) ->
     %% Pick the least loaded (ideally local) vnode to perform a
     %% GET. The other entries will be used for HEADs.
-
     {LocalPreflist, RemotePreflist} = partition_local_remote(Preflist),
-
-    case riak_kv_fsm_common:check_mailboxes(LocalPreflist) of
-        {true, Entry} ->
-            Entry;
-        {false, LocalMBoxData} ->
-            case riak_kv_fsm_common:check_mailboxes(RemotePreflist) of
-                {true, Remote} ->
-                     Remote;
-                {false, RemoteMBoxData} ->
-                    {_Loc, Entry} = riak_kv_fsm_common:select_least_loaded_entry(LocalMBoxData, RemoteMBoxData),
-		    Entry
-            end
-    end;
+    select_least_loaded(LocalPreflist, RemotePreflist);
 select_get_entry(Preflist, get_then_head_plhead) ->
-    %% always choose the head of the preflist, for maximum disk cache
-    %% use (but possible worse behaviour if the head node is
-    %% anavailable?) The chosen entry will be used to do a GET, while
-    %% the other entries will be used for HEAD requests
-    {Entry, _Type} = hd(Preflist),
-    Entry;
+    %% treat the head of the preflist as the "local" entry, for
+    %% maximum disk cache use (but possible worse behaviour if the
+    %% head node is anavailable?) The chosen entry will be used to do
+    %% a GET, while the other entries will be used for HEAD requests
+    {HeadEntry, _Type} = hd(Preflist),
+    TailEntries = [TEntry || {TEntry, _TType} <- tl(Preflist)],
+    select_least_loaded([HeadEntry], TailEntries);
 select_get_entry(_Preflist, head_then_get) ->
     %% no preselection of a vnode to GET from, do N heads, then pick a
     %% GET vnode (see `execute')
     undefined.
+
+select_least_loaded(Preferred, Rest) ->
+    case riak_kv_fsm_common:check_mailboxes(Preferred) of
+        {true, Entry} ->
+            Entry;
+        {false, PrefMBoxData} ->
+            case riak_kv_fsm_common:check_mailboxes(Rest) of
+                {true, Other} ->
+                     Other;
+                {false, RestMBoxData} ->
+                    %% don't favour any, just take the least loaded
+                    {_Loc, Entry} = riak_kv_fsm_common:select_least_loaded_entry([], PrefMBoxData++RestMBoxData),
+		    Entry
+            end
+    end.
 
 -ifdef(TEST).
 -define(expect_msg(Exp,Timeout),
