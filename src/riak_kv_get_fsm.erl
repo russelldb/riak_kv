@@ -66,9 +66,11 @@
 -type options() :: [option()].
 -type req_id() :: non_neg_integer().
 -type preflist_entry() :: {Idx::non_neg_integer(), node()}.
--type request_strategy() :: get_then_head_plhead | get_then_head_softlimt | head_then_get.
+-type request_strategy() :: get_then_head_plhead | get_then_head_local | head_then_get.
 
 -export_type([options/0, option/0]).
+
+-define(DEFAULT_REQUEST_STRATEGY, get_then_head_local).
 
 -record(state, {from :: {raw, req_id(), pid()},
                 options=[] :: options(),
@@ -95,7 +97,7 @@
                 %% do it, unless we're told not to @TODO(rdb) make
                 %% this a bucket level config, for now/WIP/discovery,
                 %% per-request is good enough
-                request_strategy = get_then_head_softlimt :: request_strategy(),
+                request_strategy = ?DEFAULT_REQUEST_STRATEGY :: request_strategy(),
                 get_pl_entry :: preflist_entry()
                }).
 
@@ -105,7 +107,6 @@
 -define(DEFAULT_R, default).
 -define(DEFAULT_PR, 0).
 -define(DEFAULT_RT, head).
--define(DEFAULT_REQUEST_STRATEGY, get_then_head_softlimt).
 
 %% ===================================================================
 %% Public API
@@ -768,7 +769,7 @@ details() ->
 %% etc.
 -spec select_get_entry(riak_core_apl:preflist_ann(), request_strategy()) ->
                               undefined | preflist_entry().
-select_get_entry(Preflist, get_then_head_softlimt) ->
+select_get_entry(Preflist, get_then_head_local) ->
     %% Pick the least loaded (ideally local) vnode to perform a
     %% GET. The other entries will be used for HEADs.
     {LocalPreflist, RemotePreflist} = partition_local_remote(Preflist),
