@@ -23,15 +23,22 @@
 %% @doc coordination of Riak PUT requests
 
 -module(riak_kv_put_fsm).
-%-ifdef(TEST).
+-ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
-%-endif.
+-endif.
 -include_lib("riak_kv_vnode.hrl").
 -include_lib("riak_kv_js_pools.hrl").
 -include("riak_kv_wm_raw.hrl").
 -include("riak_kv_types.hrl").
 
 -behaviour(gen_fsm).
+
+-import(riak_kv_fsm_common, [get_option/2, get_option/3,
+                             get_bucket_props/1,
+                             get_n_val/2,
+                             get_preflist/5,
+                             partition_local_remote/1]).
+
 -define(DEFAULT_OPTS, [{returnbody, false}, {update_last_modified, true}]).
 -export([start/3,start/6,start/7]).
 -export([start_link/3,start_link/6,start_link/7]).
@@ -76,7 +83,14 @@
         %% Some CRDTs and other client operations that cannot tolerate
         %% an automatic retry on the server side; those operations should
         %% use {retry_put_coordinator_failure, false}.
-        {retry_put_coordinator_failure, boolean()}.
+        {retry_put_coordinator_failure, boolean()} |
+        %% When selecting a coordinator, `mbox_check' controls wether
+        %% the vnode mailbox soft-limit is checked. see riak#gh1661
+        %% for details. NOTE: defaults to `true' but will be set to
+        %% `false' by the puts_fsm when it forwards to a new put fsm
+        %% i.e. ONLY forward once, when a coordinator is chosen, use
+        %% it.
+        {mbox_check, boolean()}.
 
 -type options() :: [option()].
 
@@ -90,7 +104,7 @@
                 dw :: non_neg_integer(),
                 pw :: non_neg_integer(),
                 node_confirms :: non_neg_integer(),
-                coord_pl_entry :: {integer(), atom()},
+                coord_pl_entry :: riak_kv_fsm_common:preflist_entry(),
                 preflist2 :: riak_core_apl:preflist_ann(),
                 bkey :: {riak_object:bucket(), riak_object:key()},
                 req_id :: pos_integer(),
@@ -200,6 +214,8 @@ monitor_remote_coordinator(true = _UseAckP, MiddleMan, CoordNode, StateData) ->
     after StateData#state.coordinator_timeout ->
             exit(MiddleMan, kill),
             Bad = StateData#state.bad_coordinators,
+            lager:warning("timed out waiting for forward-ack, adding ~p to bad coordinators",
+                          [CoordNode]),
             prepare(timeout, StateData#state{bad_coordinators=[CoordNode|Bad]})
     end.
 
@@ -274,113 +290,12 @@ init({test, Args, StateProps}) ->
     {ok, validate, TestStateData}.
 
 %% @private
-prepare(timeout, StateData0 = #state{from = From, robj = RObj,
-                                     bkey = BKey = {Bucket, _Key},
-                                     options = Options,
-                                     trace = Trace,
-                                     bad_coordinators = BadCoordinators}) ->
-    {ok, DefaultProps} = application:get_env(riak_core, 
-                                             default_bucket_props),
-    BucketProps = riak_core_bucket:get_bucket(riak_object:bucket(RObj)),
-    %% typed buckets never fall back to defaults
-    Props = 
-        case is_tuple(Bucket) of
-            false -> 
-                lists:keymerge(1, lists:keysort(1, BucketProps), 
-                               lists:keysort(1, DefaultProps));
-            true ->
-                BucketProps
-        end,
-    DocIdx = riak_core_util:chash_key(BKey, BucketProps),
-    Bucket_N = get_option(n_val, BucketProps),
-    N = case get_option(n_val, Options, false) of
-            false ->
-                Bucket_N;
-            N_val when is_integer(N_val), N_val > 0, N_val =< Bucket_N ->
-                %% don't allow custom N to exceed bucket N
-                N_val;
-            Bad_N ->
-                {error, {n_val_violation, Bad_N}}
-        end,
-    case N of
-        {error, _} = Error ->
-            process_reply(Error, StateData0);
-        _ ->
-            StatTracked = get_option(stat_tracked, BucketProps, false),
-            Preflist2 = 
-                case get_option(sloppy_quorum, Options, true) of
-                    true ->
-                        UpNodes = riak_core_node_watcher:nodes(riak_kv),
-                        riak_core_apl:get_apl_ann(DocIdx, N, 
-                                                  UpNodes -- BadCoordinators);
-                    false ->
-                        Preflist1 =
-                            riak_core_apl:get_primary_apl(DocIdx, N, riak_kv),
-                        [X || X = {{_Index, Node}, _Type} <- Preflist1,
-                              not lists:member(Node, BadCoordinators)]
-                end,
-            %% Check if this node is in the preference list so it can coordinate
-            LocalPL = [IndexNode || {{_Index, Node} = IndexNode, _Type} <- Preflist2,
-                                Node == node()],
-            Must = (get_option(asis, Options, false) /= true),
-            case {Preflist2, LocalPL =:= [] andalso Must == true} of
-                {[], _} ->
-                    %% Empty preflist
-                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1], 
-                            ["prepare",<<"all nodes down">>]),
-                    process_reply({error, all_nodes_down}, StateData0);
-                {_, true} ->
-                    %% This node is not in the preference list
-                    %% forward on to a random node
-                    {ListPos, _} = random:uniform_s(length(Preflist2), os:timestamp()),
-                    {{_Idx, CoordNode},_Type} = lists:nth(ListPos, Preflist2),
-                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
-                            ["prepare", atom2list(CoordNode)]),
-                    try
-                        {UseAckP, Options2} = make_ack_options(
-                                               [{ack_execute, self()}|Options]),
-                        MiddleMan = spawn_coordinator_proc(
-                                      CoordNode, riak_kv_put_fsm, start_link,
-                                      [From,RObj,Options2]),
-                        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
-                                ["prepare", atom2list(CoordNode)]),
-                        ok = riak_kv_stat:update(coord_redir),
-                        monitor_remote_coordinator(UseAckP, MiddleMan,
-                                                   CoordNode, StateData0)
-                    catch
-                        _:Reason ->
-                            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
-                                    ["prepare", dtrace_errstr(Reason)]),
-                            lager:error("Unable to forward put for ~p to ~p - ~p @ ~p\n",
-                                        [BKey, CoordNode, Reason, erlang:get_stacktrace()]),
-                            process_reply({error, {coord_handoff_failed, Reason}}, StateData0)
-                    end;
-                _ ->
-                    %% Putting asis, no need to handle locally on a node in the
-                    %% preflist, can coordinate from anywhere
-                    CoordPLEntry = case Must of
-                                    true ->
-                                        hd(LocalPL);
-                                    _ ->
-                                        undefined
-                                end,
-                    CoordPlNode = case CoordPLEntry of
-                                    undefined  -> undefined;
-                                    {_Idx, Nd} -> atom2list(Nd)
-                                end,
-                    %% This node is in the preference list, continue
-                    StartTime = riak_core_util:moment(),
-                    StateData = StateData0#state{n = N,
-                                                bucket_props = Props,
-                                                coord_pl_entry = CoordPLEntry,
-                                                preflist2 = Preflist2,
-                                                starttime = StartTime,
-                                                tracked_bucket = StatTracked},
-                    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0], 
-                            ["prepare", CoordPlNode]),
-                    new_state_timeout(validate, StateData)
-            end
-    end.
+prepare(timeout, State = #state{robj = RObj, options=Options}) ->
+    Bucket = riak_object:bucket(RObj),
+    BucketProps = get_bucket_props(Bucket),
+    StatTracked = get_option(stat_tracked, BucketProps, false),
+    N = get_n_val(Options, BucketProps),
+    get_preflist(N, State#state{tracked_bucket=StatTracked, bucket_props=BucketProps}).
 
 %% @private
 validate(timeout, StateData0 = #state{from = {raw, ReqId, _Pid},
@@ -730,6 +645,14 @@ handle_info({ack, Node, now_executing}, StateName, StateData) ->
     late_put_fsm_coordinator_ack(Node),
     ok = riak_kv_stat:update(late_put_fsm_coordinator_ack),
     {next_state, StateName, StateData};
+handle_info({mbox, _}, StateName, StateData)  ->
+    %% Delayed mailbox size check response, ignore it
+    case timeout_state(StateName) of
+	true ->
+	    {next_state, StateName, StateData, 0};
+	false ->
+	    {next_state, StateName, StateData}
+    end;
 handle_info(_Info, _StateName, StateData) ->
     {stop,badmsg,StateData}.
 
@@ -743,6 +666,21 @@ code_change(_OldVsn, StateName, State, _Extra) -> {ok, StateName, State}.
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
+%% @private the `prepare' state sends some `soft-limit' messages to
+%% vnode proxies. It only waits for the first good response. The rest
+%% of the responses will be handled by `handle_info'. Some states (see
+%% function body) are transitioned to via a `timeout' event. This
+%% event is set up by the return from the previous state. The docs for
+%% gen_fsm say: "If an integer timeout value is provided, a timeout
+%% will occur unless an event or a message is received within Timeout
+%% milliseconds". In cases where the message is on the mailbox before
+%% a state finishes, the Timeout is cancelled before it begins, and
+%% handle_info is called, unless handle_info returns a timeout the fsm
+%% can just hang in the new state. This function decides if
+%% `StateName' is such a state that needs a 0 timeout adding to the
+%% return from handle_info.
+timeout_state(StateName) ->
+    lists:member(StateName, [validate, precommit, postcommit, finish]).
 
 %% Move to the new state, marking the time it started
 new_state(StateName, StateData=#state{trace = true}) ->
@@ -984,17 +922,6 @@ get_hooks(postcommit, BucketProps, #state{bkey=BKey}) ->
     CondHooks = riak_kv_hooks:get_conditional_postcommit(BKey, BucketProps),
     BaseHooks ++ (CondHooks -- BaseHooks).
 
-get_option(Name, Options) ->
-    get_option(Name, Options, undefined).
-
-get_option(Name, Options, Default) ->
-    case lists:keyfind(Name, 1, Options) of
-        {_, Val} ->
-            Val;
-        false ->
-            Default
-    end.
-
 schedule_timeout(infinity) ->
     undefined;
 schedule_timeout(Timeout) ->
@@ -1055,3 +982,140 @@ dtrace_errstr(Term) ->
 %% This function is for dbg tracing purposes
 late_put_fsm_coordinator_ack(_Node) ->
     ok.
+
+%% @private given no n-val violation, generate a preflist.
+get_preflist({error, _Reason}=Err, State) ->
+    process_reply(Err, State);
+get_preflist(N, State) ->
+    #state{bkey = BKey,
+           options = Options,
+           bucket_props=BucketProps,
+           bad_coordinators = BadCoordinators} = State,
+
+    Preflist = get_preflist(N, BKey, BucketProps, Options, BadCoordinators),
+    coordinate_or_forward(Preflist, State#state{n=N}).
+
+%% @private if there is a non-empty preflist, select a coordinator, as
+%% needed.
+coordinate_or_forward([], State=#state{trace=Trace}) ->
+    %% Empty preflist
+    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-1],
+            ["prepare",<<"all nodes down">>]),
+    process_reply({error, all_nodes_down}, State);
+coordinate_or_forward(Preflist, State) ->
+    #state{options = Options, n = N, trace=Trace} = State,
+    CoordinatorType = get_coordinator_type(Options),
+    MBoxCheck = get_option(mbox_check, Options, true),
+
+    case select_coordinator(Preflist, CoordinatorType, MBoxCheck) of
+        {local, CoordPLEntry} ->
+            %% for DTRACE
+            CoordPlNode = case CoordPLEntry of
+                              undefined  -> undefined;
+                              {_Idx, Nd} -> atom2list(Nd)
+                          end,
+            StartTime = riak_core_util:moment(),
+            StateData = State#state{n = N,
+                                    coord_pl_entry = CoordPLEntry,
+                                    preflist2 = Preflist,
+                                    starttime = StartTime},
+            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [0],
+                    ["prepare", CoordPlNode]),
+            new_state_timeout(validate, StateData);
+        {remote, {_Idx, ForwardNode}} ->
+            forward(ForwardNode, State)
+    end.
+
+%% @private selects a coordinating vnode for the put, depending on
+%% locality, mailbox length, etc.
+-spec select_coordinator(riak_core_apl:preflist_ann(), local | any, boolean()) ->
+                                {local, riak_kv_fsm_common:preflist_entry()} |
+                                {local, undefined} |
+                                {remote, riak_kv_fsm_common:preflist_entry()}.
+select_coordinator(Preflist, _CoordinatorType=local, true=_MBoxCheck) ->
+    %% wants local, if there are local entries, check mailbox soft
+    %% limits (see riak#1661) locally first, only checking remote if
+    %% no local-preflist, or local softloaded/not replying.
+
+    %% NOTE:: an annotated preflist goes in, two un-annotated come out
+    {LocalPreflist, RemotePreflist} = partition_local_remote(Preflist),
+
+    case riak_kv_fsm_common:check_mailboxes(LocalPreflist) of
+        {true, Entry} ->
+            {local, Entry};
+        {false, LocalMBoxData} ->
+            case riak_kv_fsm_common:check_mailboxes(RemotePreflist) of
+                {true, Remote} ->
+                    {remote, Remote};
+                {false, RemoteMBoxData} ->
+                    riak_kv_fsm_common:select_least_loaded_entry(LocalMBoxData, RemoteMBoxData)
+            end
+    end;
+select_coordinator(Preflist, _CoordinatorType=local, false=_MBoxCheck) ->
+    %% No mailbox check, don't change behaviour from pre-gh1661 work
+    {LocalPreflist, _RemotePreflist} = partition_local_remote(Preflist),
+    {local, hd(LocalPreflist)};
+select_coordinator(_Preflist, any=_CoordinatorType, _MBoxCheck) ->
+    %% for `any' type coordinator downstream code expects `undefined',
+    %% no coordinator, no mailbox queues to route around
+    {local, undefined}.
+
+%% @private decide if the coordinator has to be a local, causality
+%% advancing vnode, or just any/all at once
+-spec get_coordinator_type(options()) -> any | local.
+get_coordinator_type(Options) ->
+    case get_option(asis, Options, false) of
+        false ->
+            local;
+        true ->
+            any
+    end.
+
+%% @private the local node is not in the preflist, or is overloaded,
+%% forward to another node
+forward(CoordNode, State) ->
+    #state{trace=Trace,
+           options=Options,
+           from=From,
+           robj=RObj,
+           bkey=BKey} = State,
+    %% This node is not in the preference list, or it's too loaded,
+    %% forward on to (a less loaded?) node
+
+    ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [1],
+            ["prepare", atom2list(CoordNode)]),
+    try
+        {UseAckP, Options2} = make_ack_options(
+                                [
+                                 %% don't check mbox at new fsm, we
+                                 %% picked the "best"
+                                 {mbox_check, false},
+                                 %% ack forwarder
+                                 {ack_execute, self()}
+                                 | Options]),
+        MiddleMan = spawn_coordinator_proc(
+                      CoordNode, riak_kv_put_fsm, start_link,
+                      [From, RObj, Options2]),
+        ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [2],
+                ["prepare", atom2list(CoordNode)]),
+        ok = riak_kv_stat:update(coord_redir),
+        monitor_remote_coordinator(UseAckP, MiddleMan,
+                                   CoordNode, State)
+    catch
+        _:Reason ->
+            ?DTRACE(Trace, ?C_PUT_FSM_PREPARE, [-2],
+                    ["prepare", dtrace_errstr(Reason)]),
+            lager:error("Unable to forward put for ~p to ~p - ~p @ ~p\n",
+                        [BKey, CoordNode, Reason, erlang:get_stacktrace()]),
+            process_reply({error, {coord_handoff_failed, Reason}}, State)
+    end.
+
+-ifdef(TEST).
+
+get_coordinator_type_test() ->
+    Opts0 = proplists:unfold([asis]),
+    ?assertEqual(any, get_coordinator_type(Opts0)),
+    Opts1 = proplists:unfold([]),
+    ?assertEqual(local, get_coordinator_type(Opts1)).
+
+-endif.
